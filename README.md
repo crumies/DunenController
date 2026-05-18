@@ -1,38 +1,19 @@
-# DUNEN Dashboard Liquid Glass
+# Aptum Dashboard - Embedded Images Fixed
 
-Custom iPhone dashboard for DUNEN FFE0 / FFE1 BLE controllers.
+This version fixes the images by embedding the logo and Aptum 8F bike picture directly inside Swift.
 
-Features:
-- Liquid glass bottom tab slider
-- Info / Advanced / Settings tabs
-- DUNEN/Aptum color scheme
-- Animated splash with logo, bike, spinning wheels, flashing light
-- BLE-only dashboard values, no phone GPS speed
-- RPM in the speedometer corner
-- Brake sensor indicators
-- KM/H / MPH setting
-- KM / Miles setting
-- Demo mode
-- Raw packet viewer for decoding DUNEN telemetry
+That means:
+- Startup logo works without Assets.xcassets
+- Startup bike works without Assets.xcassets
+- Settings logo works without Assets.xcassets
+- No GitHub raw image loading needed
+- No internet needed for app images
 
-## Build
+Only the app icon still uses Assets.xcassets because iOS app icons must be bundled that way.
 
-Upload all files to GitHub root.
-
-Make sure your repo has:
-- project.yml
-- Sources/
-- Assets.xcassets/
-- .github/workflows/build-ios.yml
-
-Delete old:
-- DunenDashboard.xcodeproj
-- old iOS app builder workflow
-
-Then run GitHub Actions: `Build iOS IPA`.
-
-Install the artifact IPA with Sideloadly on Windows.
-
-## Important
-
-The BLE parser has placeholder best-guess byte offsets. The app will connect and show raw packets, but RPM/speed/brakes may need correction after you send raw packets from your real controller.
+Build:
+1. Delete old repo files if needed.
+2. Upload this ZIP contents to repo root.
+3. Run GitHub Actions.
+4. Delete old app from iPhone.
+5. Install the new IPA.
