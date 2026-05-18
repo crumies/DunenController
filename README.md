@@ -11,3 +11,6 @@ This version uses XcodeGen, so there is no broken hand-written `.pbxproj`.
 5. Sign/install with Sideloadly on Windows.
 
 Free Apple ID sideload usually expires after 7 days.
+
+
+IMPORTANT: Delete any old `DunenDashboard.xcodeproj` from your GitHub repo before uploading this version. The workflow also removes it automatically before generating a clean one.
