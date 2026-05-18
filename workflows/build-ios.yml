@@ -1,0 +1,57 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Remove old generated files
+        run: |
+          rm -rf DunenDashboard.xcodeproj
+          rm -rf build
+          rm -rf Payload
+          rm -f DunenDashboard-unsigned.ipa
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate clean Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Build unsigned app
+        run: |
+          xcodebuild clean build \
+            -project DunenDashboard.xcodeproj \
+            -scheme DunenDashboard \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            -derivedDataPath build
+
+      - name: Create unsigned IPA
+        run: |
+          mkdir -p Payload
+          APP_PATH=$(find build/Build/Products/Release-iphoneos -name "*.app" -type d | head -n 1)
+          echo "APP_PATH=$APP_PATH"
+          cp -R "$APP_PATH" Payload/
+          zip -r DunenDashboard-unsigned.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: DunenDashboard-unsigned-ipa
+          path: DunenDashboard-unsigned.ipa
