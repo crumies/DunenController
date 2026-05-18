@@ -1,5 +1,6 @@
 import Foundation
 import CoreBluetooth
+import Combine
 
 struct DiscoveredBLEDevice: Identifiable, Equatable {
     let id: UUID
@@ -14,7 +15,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
     @Published var isScanning: Bool = false
     @Published var isConnected: Bool = false
     @Published var connectedName: String?
-    @Published var latestHex: String = ""
+    @Published var telemetry = Telemetry()
     @Published var packetLog: [String] = []
 
     private var central: CBCentralManager!
@@ -68,11 +69,48 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
     private func addPacket(_ data: Data) {
         let hex = data.map { String(format: "%02X", $0) }.joined(separator: " ")
-        latestHex = hex
+        telemetry.rawHex = hex
+        telemetry.packetCount += 1
         packetLog.insert(hex, at: 0)
+        if packetLog.count > 40 { packetLog.removeLast() }
 
-        if packetLog.count > 30 {
-            packetLog.removeLast()
+        decodeBestGuess(data)
+    }
+
+    // Best-guess parser only. Real RPM/speed/brake byte offsets must be tuned after comparing raw packets.
+    private func decodeBestGuess(_ data: Data) {
+        let b = [UInt8](data)
+        guard b.count >= 8 else { return }
+
+        // These guesses are intentionally conservative so the app can run now.
+        // Send raw packets later and these offsets can be corrected.
+        if b.count >= 12 {
+            let vRaw = UInt16(b[2]) | (UInt16(b[3]) << 8)
+            let rpmRaw = UInt16(b[4]) | (UInt16(b[5]) << 8)
+            let speedRaw = UInt16(b[6]) | (UInt16(b[7]) << 8)
+
+            let voltage = Double(vRaw) / 10.0
+            if voltage > 20 && voltage < 120 { telemetry.voltage = voltage }
+
+            let rpm = Int(rpmRaw)
+            if rpm >= 0 && rpm < 20000 { telemetry.rpm = rpm }
+
+            let speed = Double(speedRaw) / 10.0
+            if speed >= 0 && speed < 180 { telemetry.speedKmh = speed }
+        }
+
+        let flag = b.last ?? 0
+        telemetry.frontBrakePressed = (flag & 0x01) != 0
+        telemetry.rearBrakePressed = (flag & 0x02) != 0
+        telemetry.regenActive = (flag & 0x04) != 0
+
+        if b.count > 14 {
+            telemetry.soc = min(100, max(0, Double(b[8])))
+            telemetry.controllerTemp = Double(Int8(bitPattern: b[9]))
+            telemetry.motorTemp = Double(Int8(bitPattern: b[10]))
+            telemetry.throttlePercent = min(100, max(0, Double(b[11])))
+            telemetry.currentA = Double(Int8(bitPattern: b[12]))
+            telemetry.phaseCurrentA = Double(UInt16(b[13]) | (UInt16(b[14]) << 8)) / 10.0
         }
     }
 
@@ -90,16 +128,11 @@ final class DunenBLEManager: NSObject, ObservableObject {
 extension DunenBLEManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         switch central.state {
-        case .poweredOn:
-            connectionStatus = "Bluetooth ready"
-        case .poweredOff:
-            connectionStatus = "Bluetooth off"
-        case .unauthorized:
-            connectionStatus = "Bluetooth permission denied"
-        case .unsupported:
-            connectionStatus = "Bluetooth not supported"
-        default:
-            connectionStatus = "Bluetooth state: \(central.state.rawValue)"
+        case .poweredOn: connectionStatus = "Bluetooth ready"
+        case .poweredOff: connectionStatus = "Bluetooth off"
+        case .unauthorized: connectionStatus = "Bluetooth permission denied"
+        case .unsupported: connectionStatus = "Bluetooth not supported"
+        default: connectionStatus = "Bluetooth state: \(central.state.rawValue)"
         }
     }
 

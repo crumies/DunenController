@@ -1,16 +1,38 @@
-# DunenDashboard iOS
+# DUNEN Dashboard Liquid Glass
 
-This version uses XcodeGen, so there is no broken hand-written `.pbxproj`.
+Custom iPhone dashboard for DUNEN FFE0 / FFE1 BLE controllers.
 
-## GitHub Actions build
+Features:
+- Liquid glass bottom tab slider
+- Info / Advanced / Settings tabs
+- DUNEN/Aptum color scheme
+- Animated splash with logo, bike, spinning wheels, flashing light
+- BLE-only dashboard values, no phone GPS speed
+- RPM in the speedometer corner
+- Brake sensor indicators
+- KM/H / MPH setting
+- KM / Miles setting
+- Demo mode
+- Raw packet viewer for decoding DUNEN telemetry
 
-1. Upload all files to a GitHub repo.
-2. Go to Actions.
-3. Run `Build iOS IPA`.
-4. Download `DunenDashboard-unsigned-ipa`.
-5. Sign/install with Sideloadly on Windows.
+## Build
 
-Free Apple ID sideload usually expires after 7 days.
+Upload all files to GitHub root.
 
+Make sure your repo has:
+- project.yml
+- Sources/
+- Assets.xcassets/
+- .github/workflows/build-ios.yml
 
-IMPORTANT: Delete any old `DunenDashboard.xcodeproj` from your GitHub repo before uploading this version. The workflow also removes it automatically before generating a clean one.
+Delete old:
+- DunenDashboard.xcodeproj
+- old iOS app builder workflow
+
+Then run GitHub Actions: `Build iOS IPA`.
+
+Install the artifact IPA with Sideloadly on Windows.
+
+## Important
+
+The BLE parser has placeholder best-guess byte offsets. The app will connect and show raw packets, but RPM/speed/brakes may need correction after you send raw packets from your real controller.

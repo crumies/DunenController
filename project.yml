@@ -12,19 +12,22 @@ targets:
     platform: iOS
     sources:
       - Sources
+    resources:
+      - Assets.xcassets
     info:
       path: Info.plist
       properties:
-        CFBundleDisplayName: DunenDashboard
+        CFBundleDisplayName: Dunen
         CFBundleIdentifier: com.crumies.DunenDashboard
         CFBundleShortVersionString: "1.0"
         CFBundleVersion: "1"
         NSBluetoothAlwaysUsageDescription: This app uses Bluetooth to connect to the DUNEN controller.
-        NSLocationWhenInUseUsageDescription: This app uses location to show GPS speed.
-        NSMotionUsageDescription: This app uses motion sensors to show tilt and G-force.
+        NSLocationWhenInUseUsageDescription: This app does not use GPS for dashboard speed, but iOS may request location for some Bluetooth discovery behavior.
+        NSMotionUsageDescription: This app does not use phone motion sensors for ride data.
         UILaunchScreen: {}
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.crumies.DunenDashboard
         TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_STYLE: Manual
