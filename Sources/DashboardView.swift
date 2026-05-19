@@ -340,18 +340,18 @@ struct RPMArc: View {
 
     var displayMaxRPM: Double {
         switch mode {
-        case .eco: return modeLimitRPM + 1200
-        case .xc: return modeLimitRPM + 1400
-        case .sports: return modeLimitRPM + 1600
-        case .reverse: return modeLimitRPM + 700
-        case .park: return modeLimitRPM + 500
+        case .eco: return 5200
+        case .xc: return 7600
+        case .sports: return 9600
+        case .reverse: return 3000
+        case .park: return 1600
         }
     }
 
     var redlineStartRPM: Double {
         switch mode {
         case .sports: return max(0, modeLimitRPM - 700)
-        case .reverse: return max(0, modeLimitRPM - 350)
+        case .reverse: return max(0, modeLimitRPM - 400)
         default: return max(0, modeLimitRPM - 500)
         }
     }
@@ -361,7 +361,7 @@ struct RPMArc: View {
     }
 
     var redlineProgress: Double {
-        min(max(redlineStartRPM / displayMaxRPM, 0), 0.98)
+        min(max(redlineStartRPM / displayMaxRPM, 0), 0.985)
     }
 
     var baseColor: Color {
@@ -374,48 +374,47 @@ struct RPMArc: View {
         }
     }
 
-    var gradientColors: [Color] {
+    var redlineColors: [Color] {
         switch mode {
         case .eco:
-            return [.green, .green, .yellow, .orange, .red]
+            return [.green, .yellow, .orange, .red]
         case .xc:
-            return [.cyan, .cyan, .blue, .purple, .red]
+            return [.cyan, .blue, .purple, .red]
         case .sports:
-            return [.orange, .orange, .red, .red.opacity(0.55), .black]
+            return [.orange, .red, Color(red: 0.22, green: 0.0, blue: 0.0), .black]
         case .reverse:
-            return [.purple, .purple, .pink, .red]
+            return [.purple, .pink, .red]
         case .park:
-            return [.white, .white.opacity(0.7)]
+            return [.white, .white.opacity(0.75)]
         }
     }
 
     var body: some View {
         ZStack {
+            // Track
             Circle()
                 .trim(from: startTrim, to: startTrim + totalTrim)
                 .stroke(.white.opacity(0.10), style: StrokeStyle(lineWidth: 16, lineCap: .round))
                 .rotationEffect(.degrees(90))
 
+            // Normal filled arc. This stays ONLY mode color.
             Circle()
-                .trim(from: startTrim, to: startTrim + progress * totalTrim)
-                .stroke(
-                    AngularGradient(
-                        gradient: Gradient(colors: gradientColors),
-                        center: .center,
-                        startAngle: .degrees(125),
-                        endAngle: .degrees(430)
-                    ),
-                    style: StrokeStyle(lineWidth: 16, lineCap: .round)
-                )
+                .trim(from: startTrim, to: startTrim + min(progress, redlineProgress) * totalTrim)
+                .stroke(baseColor, style: StrokeStyle(lineWidth: 16, lineCap: .round))
                 .rotationEffect(.degrees(90))
                 .shadow(color: baseColor.opacity(0.35), radius: 10)
 
-            if progress < redlineProgress {
-                // Cover the future redline section with the base mode color so it does not appear too early.
+            // Redline filled arc. This is only drawn AFTER redline start,
+            // so the red/orange/black can never show at the beginning.
+            if progress > redlineProgress {
                 Circle()
-                    .trim(from: startTrim + progress * totalTrim, to: startTrim + redlineProgress * totalTrim)
-                    .stroke(baseColor.opacity(0.0), style: StrokeStyle(lineWidth: 16, lineCap: .round))
+                    .trim(from: startTrim + redlineProgress * totalTrim, to: startTrim + progress * totalTrim)
+                    .stroke(
+                        LinearGradient(colors: redlineColors, startPoint: .leading, endPoint: .trailing),
+                        style: StrokeStyle(lineWidth: 16, lineCap: .round)
+                    )
                     .rotationEffect(.degrees(90))
+                    .shadow(color: .red.opacity(0.34), radius: 11)
             }
         }
     }

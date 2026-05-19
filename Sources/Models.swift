@@ -166,6 +166,22 @@ struct Telemetry: Equatable {
     var packetCount: Int = 0
     var productModel: String = "DEMCC2416QS035ZFS01"
     var controllerName: String = "DUNEN312"
+    var soc: Double {
+        batteryPercent
+    }
+
+    var frontBrakePressed: Bool {
+        brakeActive
+    }
+
+    var rearBrakePressed: Bool {
+        brakeActive
+    }
+
+    var brakePressed: Bool {
+        brakeActive
+    }
+
 }
 
 struct TelemetryHistory {

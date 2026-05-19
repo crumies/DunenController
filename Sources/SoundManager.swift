@@ -15,7 +15,8 @@ final class SoundManager {
 
     func playScanningSound(enabled: Bool) {
         guard enabled else { return }
-        play("scanning", fallbackID: 1157)
+        // Backup/fallback for scanning is different from startup/connect/confirm.
+        play("scanning", fallbackID: 1020)
     }
 
     func playConnectSound(enabled: Bool) {
@@ -32,7 +33,8 @@ final class SoundManager {
 
     func playConfirmSound(enabled: Bool = true) {
         guard enabled else { return }
-        play("confirm", fallbackID: 1114)
+        // Backup/fallback for confirmations/popups is unique.
+        play("confirm", fallbackID: 1108)
         UINotificationFeedbackGenerator().notificationOccurred(.success)
     }
 

@@ -27,8 +27,8 @@ targets:
       properties:
         CFBundleDisplayName: Aptum Dashboard
         CFBundleIdentifier: com.crumies.AptumDashboard
-        CFBundleShortVersionString: "6.1"
-        CFBundleVersion: "61"
+        CFBundleShortVersionString: "6.2"
+        CFBundleVersion: "62"
         UILaunchScreen: {}
         NSBluetoothAlwaysUsageDescription: This app uses Bluetooth to connect to the DUNEN controller.
         NSLocationWhenInUseUsageDescription: This app does not use GPS for dashboard speed.
