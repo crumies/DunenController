@@ -4,47 +4,59 @@ struct RootView: View {
     @EnvironmentObject var ble: DunenBLEManager
     @EnvironmentObject var settings: AppSettings
 
-    @State private var selectedTab: AppTab = .info
+    @State private var selectedTab: AppTab = .dashboard
     @State private var showSplash = true
 
-    var displayTelemetry: Telemetry {
-        settings.demoMode && !ble.isConnected ? .demo : ble.telemetry
+    var showConnection: Bool {
+        !ble.isConnected && !ble.isDemoMode && !showSplash
     }
 
     var body: some View {
-        ZStack {
-            AppBackground()
+        TimelineView(.periodic(from: .now, by: 0.1)) { _ in
+            ZStack(alignment: .top) {
+                AppBackground()
 
-            VStack(spacing: 0) {
-                Group {
-                    switch selectedTab {
-                    case .info:
-                        InfoView(telemetry: displayTelemetry)
-                    case .advanced:
-                        AdvancedView(telemetry: displayTelemetry)
-                    case .diagnostics:
-                        DiagnosticsView(telemetry: displayTelemetry)
-                    case .settings:
-                        SettingsView()
+                if showConnection {
+                    ConnectionHomeView()
+                } else {
+                    VStack(spacing: 0) {
+                        Group {
+                            switch selectedTab {
+                            case .dashboard:
+                                DashboardView()
+                            case .advanced:
+                                AdvancedInfoView()
+                            case .tuning:
+                                TuningView()
+                            case .diagnostics:
+                                DiagnosticsView()
+                            case .settings:
+                                SettingsView()
+                            }
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                        LiquidTabBar(selectedTab: $selectedTab)
+                            .padding(.horizontal, 10)
+                            .padding(.bottom, 8)
                     }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                LiquidTabBar(selectedTab: $selectedTab)
-                    .padding(.horizontal, 14)
-                    .padding(.bottom, 8)
-            }
+                if ble.isDemoMode && settings.developerUnlocked {
+                    DemoDeveloperOverlay()
+                        .zIndex(8)
+                }
 
-            if showSplash && settings.startupAnimation {
-                StartupSplash()
-                    .transition(.opacity)
-                    .zIndex(10)
+                if showSplash && settings.startupAnimation {
+                    StartupSplash()
+                        .transition(.opacity)
+                        .zIndex(10)
+                }
             }
         }
-        .preferredColorScheme(.dark)
         .onAppear {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.35) {
-                withAnimation(.easeInOut(duration: 0.35)) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
+                withAnimation(.easeInOut(duration: 0.45)) {
                     showSplash = false
                 }
             }

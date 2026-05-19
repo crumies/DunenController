@@ -1,67 +1,52 @@
 import SwiftUI
 
 struct StartupSplash: View {
-    @State private var wheelSpin = false
-    @State private var lightFlash = false
-    @State private var logoPulse = false
+    @State private var scale = 0.78
+    @State private var glow = false
+    @State private var sweep = false
+    @State private var fadeText = false
 
     var body: some View {
         ZStack {
             AppBackground()
 
-            VStack(spacing: 24) {
-                AptumLogoImage()
-                    .frame(width: 132, height: 132)
-                    .rotationEffect(.degrees(logoPulse ? 360 : 0))
-                    .shadow(color: .cyan.opacity(logoPulse ? 0.8 : 0.25), radius: logoPulse ? 36 : 12)
-                    .scaleEffect(logoPulse ? 1.04 : 0.96)
+            Circle()
+                .fill(.cyan.opacity(glow ? 0.30 : 0.09))
+                .blur(radius: 105)
+                .frame(width: glow ? 500 : 260)
 
-                ZStack {
-                    AptumBikeImage()
-                        .frame(width: 310)
-                        .shadow(color: .cyan.opacity(0.25), radius: 20)
-
+            ZStack {
+                ForEach(0..<3, id: \.self) { index in
                     Circle()
-                        .trim(from: 0.05, to: 0.35)
-                        .stroke(.cyan, style: StrokeStyle(lineWidth: 4, lineCap: .round))
-                        .frame(width: 70, height: 70)
-                        .rotationEffect(.degrees(wheelSpin ? 720 : 0))
-                        .offset(x: -98, y: 72)
-
-                    Circle()
-                        .trim(from: 0.05, to: 0.35)
-                        .stroke(.cyan, style: StrokeStyle(lineWidth: 4, lineCap: .round))
-                        .frame(width: 70, height: 70)
-                        .rotationEffect(.degrees(wheelSpin ? 720 : 0))
-                        .offset(x: 105, y: 72)
-
-                    Capsule()
-                        .fill(.cyan.opacity(lightFlash ? 0.75 : 0.0))
-                        .frame(width: 90, height: 10)
-                        .blur(radius: 8)
-                        .offset(x: -135, y: -12)
+                        .trim(from: 0.05, to: 0.32)
+                        .stroke(.cyan.opacity(0.16), style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                        .frame(width: CGFloat(240 + index * 70), height: CGFloat(240 + index * 70))
+                        .rotationEffect(.degrees(sweep ? 360 + Double(index * 55) : Double(index * 55)))
+                        .animation(.linear(duration: 3.2 + Double(index) * 0.55).repeatForever(autoreverses: false), value: sweep)
                 }
 
-                Text("APTUM DASHBOARD")
-                    .font(.system(size: 22, weight: .heavy, design: .rounded))
-                    .tracking(3)
-                    .foregroundStyle(.white)
+                Circle()
+                    .stroke(.white.opacity(glow ? 0.10 : 0.04), lineWidth: 1)
+                    .frame(width: glow ? 420 : 280)
+                    .animation(.easeInOut(duration: 1.25).repeatForever(autoreverses: true), value: glow)
+            }
 
-                Text("Connecting to FFE0")
+            VStack(spacing: 20) {
+                AptumLogoImage()
+                    .frame(width: 340, height: 122)
+                    .scaleEffect(scale)
+                    .shadow(color: .cyan.opacity(glow ? 0.58 : 0.18), radius: glow ? 36 : 12)
+
+                Text("Connecting electric drive")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.cyan)
+                    .foregroundStyle(.cyan.opacity(fadeText ? 0.95 : 0.45))
             }
         }
         .onAppear {
-            withAnimation(.linear(duration: 1.2).repeatForever(autoreverses: false)) {
-                wheelSpin = true
-            }
-            withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
-                logoPulse = true
-            }
-            withAnimation(.easeInOut(duration: 0.18).repeatCount(4, autoreverses: true).delay(0.45)) {
-                lightFlash = true
-            }
+            withAnimation(.spring(response: 1.05, dampingFraction: 0.74)) { scale = 1.0 }
+            withAnimation(.easeInOut(duration: 0.85).repeatForever(autoreverses: true)) { glow = true }
+            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { fadeText = true }
+            sweep = true
         }
     }
 }
