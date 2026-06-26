@@ -66,6 +66,11 @@ enum DunenProtocol {
         modbusWriteU32Frame(start: 0x02E1, raw: 0)
     }
 
+    /// Public version of the write frame builder — used by ProtocolDevView for preview.
+    static func modbusWriteU32FramePublic(start: Int, raw: UInt32) -> Data {
+        modbusWriteU32Frame(start: start, raw: raw)
+    }
+
     private static func modbusWriteU32Frame(start: Int, raw: UInt32) -> Data {
         let bytes: [UInt8] = [
             0x01,

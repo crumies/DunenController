@@ -24,24 +24,17 @@ targets:
 
     info:
       path: Info.plist
-      properties:
-        CFBundleDisplayName: Aptum Dashboard
-        CFBundleIdentifier: com.crumies.AptumDashboard
-        CFBundleShortVersionString: "11.5"
-        CFBundleVersion: "115"
-        UILaunchScreen: {}
-        NSBluetoothAlwaysUsageDescription: This app uses Bluetooth to connect to the DUNEN controller.
-        NSLocationWhenInUseUsageDescription: This app does not use GPS for dashboard speed.
-        NSMotionUsageDescription: This app does not use phone motion sensors.
-        UIFileSharingEnabled: true
-        LSSupportsOpeningDocumentsInPlace: true
-        UISupportsDocumentBrowser: true
-        CFBundleIconName: AppIcon
+
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.crumies.AptumDashboard
         IPHONEOS_DEPLOYMENT_TARGET: 16.2
         TARGETED_DEVICE_FAMILY: "1"
+        # Tell the asset catalogue compiler which icon set to compile.
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Tell the linker / installer the icon name (backs CFBundleIconName).
         INFOPLIST_KEY_CFBundleIconName: AppIcon
+        # Do NOT let Xcode generate/merge Info.plist keys — use our file verbatim.
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Info.plist
         CODE_SIGN_STYLE: Manual

@@ -9,6 +9,7 @@ struct SettingsView: View {
     @State private var showDeveloperOptions = false
     @State private var showTuningWarning = false
     @State private var requestedTuningState = false
+    @State private var showModeSelect = false
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -36,6 +37,23 @@ struct SettingsView: View {
                             }
                         }
                         .pickerStyle(.segmented)
+                    }
+
+                    modernSection("Controller Mode", system: "dial.high.fill") {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(settings.controllerAppMode == .standard ? "Standard" : "Development")
+                                    .font(.headline)
+                                Text(settings.controllerAppMode == .standard
+                                     ? "Clean dashboard — speed, battery, temps."
+                                     : "All features + Protocol tab (raw Modbus registers).")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("Change") { showModeSelect = true }
+                                .buttonStyle(.bordered)
+                                .tint(.cyan)
+                        }
                     }
 
                     modernSection("App", system: "app.badge.fill") {
@@ -146,6 +164,10 @@ struct SettingsView: View {
                 .environmentObject(settings)
                 .environmentObject(ble)
                 .presentationDetents([.medium, .large])
+        }
+        .sheet(isPresented: $showModeSelect) {
+            AppModeSelectView(isPresented: $showModeSelect)
+                .environmentObject(settings)
         }
     }
 

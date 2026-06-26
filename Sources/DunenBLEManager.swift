@@ -27,6 +27,9 @@ final class DunenBLEManager: NSObject, ObservableObject {
     @Published var demoSpeedKmh: Double = 0
     @Published var rideStats = RideStats()
     @Published var diagnosticEvents: [DiagnosticEvent] = []
+    // Raw Modbus register words from the most-recently-requested protocol dev block.
+    @Published var protocolDevRegisters: [ProtocolRegisterWord] = []
+    @Published var protocolDevStatus: String = "Idle"
 
     private var central: CBCentralManager!
     private var connectedPeripheral: CBPeripheral?
@@ -43,6 +46,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
     private var inFlightReadStart: Int?
     private var inFlightSentAt: Date?
     private var lastDecodedStart: Int?
+    private var protocolDevReadStart: Int?
     private var bootScanDone: Bool = false
     private var didSendLiveEnable: Bool = false
     private var lastLiveNotifyAt: Date?
@@ -237,6 +241,54 @@ final class DunenBLEManager: NSObject, ObservableObject {
             self.tuningStore?.confirmWritten(ids: ids)
         }
     }
+    /// Protocol-dev mode: request a raw Modbus block from the controller.
+    /// start = register address (e.g. 0x0400, 0x03E8, 2, etc.)
+    /// count = number of 16-bit registers to read (max 24 recommended per PDF)
+    func requestRawBlock(start: Int, count: Int = 24) {
+        // In demo mode, generate plausible mock register data.
+        if isDemoMode {
+            protocolDevStatus = "Demo: Simulated 0x\(String(start, radix: 16, uppercase: true)) × \(count)"
+            var mockWords: [ProtocolRegisterWord] = []
+            for i in stride(from: 0, to: count - 1, by: 2) {
+                let addr = start + i
+                // Generate values that look like real controller table data.
+                let mockU32 = UInt32(arc4random_uniform(0xFFFFFF))
+                let iq16 = Double(Int32(bitPattern: mockU32)) / 65536.0
+                mockWords.append(ProtocolRegisterWord(address: addr, word: Int(mockU32 >> 16), u32Value: mockU32, iq16Value: iq16, note: "demo"))
+            }
+            protocolDevRegisters = mockWords
+            return
+        }
+        guard let p = connectedPeripheral,
+              let c = notifyCharacteristic ?? secondaryWriteCharacteristic ?? writeCharacteristic else {
+            protocolDevStatus = "Not connected"
+            return
+        }
+        protocolDevStatus = "Requesting 0x\(String(start, radix: 16, uppercase: true)) × \(count)"
+        protocolDevRegisters = []
+        protocolDevReadStart = start
+        inFlightReadStart = start
+        inFlightSentAt = Date()
+        let frame = DunenProtocol.modbusReadFrame(start: start, count: count)
+        let type: CBCharacteristicWriteType = c.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+        appLogger.logPacket("TX", characteristic: c, data: frame, note: "protocolDev rawBlock start=0x\(String(start, radix: 16)) count=\(count)")
+        p.writeValue(frame, for: c, type: type)
+    }
+
+    /// Protocol-dev mode: send a raw Modbus write for a single 32-bit value.
+    func requestWrite(start: Int, raw: UInt32) {
+        guard let p = connectedPeripheral,
+              let c = writeCharacteristic else {
+            protocolDevStatus = "Not connected (write)"
+            return
+        }
+        let frame = DunenProtocol.modbusWriteU32FramePublic(start: start, raw: raw)
+        let type: CBCharacteristicWriteType = c.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+        appLogger.logPacket("TX-PROTO-WRITE", characteristic: c, data: frame, note: "protocolDev write start=0x\(String(start, radix: 16)) raw=\(raw)")
+        p.writeValue(frame, for: c, type: type)
+        protocolDevStatus = "Wrote 0x\(String(start, radix: 16, uppercase: true)) = \(raw)"
+    }
+
     func liveActivityDebugStatus() { developerStatus = "Live Activity removed" }
     func forceLiveActivityRefresh() { developerStatus = "Live Activity removed" }
 
@@ -620,6 +672,13 @@ final class DunenBLEManager: NSObject, ObservableObject {
             inFlightSentAt = nil
             lastDecodedStart = expectedStart
 
+            // Protocol dev raw block — decode into the register word list.
+            if let devStart = protocolDevReadStart, devStart == expectedStart {
+                protocolDevReadStart = nil
+                decodeProtocolDevBlock(data, start: expectedStart)
+                return
+            }
+
             appLogger.log("PARSER", "matchedStart=0x\(String(expectedStart, radix: 16)) len=\(data.count)")
             if expectedStart < 1000 && expectedStart != 0x0122 && expectedStart != 0x013A && expectedStart != 0x0152 {
                 let values = DunenProtocol.parseParameterValues(from: data, expectedStart: expectedStart)
@@ -709,13 +768,10 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
             let rawMotor = abs(s16(18))
             lastRawMotorCount = rawMotor
-
-            // Do not show raw motor count as lean. Motor angle is electrical raw angle/count.
             telemetry.motorAngle = rawMotor
             telemetry.zeroAngle = u16(20)
 
             // RPM: if speed/throttle is idle, force 0. Otherwise estimate from corrected speed/gearing.
-            // Raw 1042 is noisy and nonzero while stopped, so it is only logged as motorAngle.
             if telemetry.speedKmh <= 0.3 {
                 telemetry.rpm = 0
                 telemetry.wheelRPM = 0
@@ -724,9 +780,22 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.wheelRPM = Double(telemetry.rpm) / finalDriveRatio
             }
 
-            // Throttle/brake state from flags; do NOT turn throttle into lean.
+            // Throttle: registers 10/11 are the throttle IQ16 value in the 0x0400 live block.
+            // IQ16: low word = fractional, high word = integer (same fixed-point as voltage/speed).
+            // Raw value is 0.0–1.0 representing 0–100% throttle opening.
+            let rawThrottle = fixedIntFrac(10, 11)
+            if rawThrottle >= 0 && rawThrottle <= 1.0 {
+                telemetry.throttleOpen = rawThrottle
+            } else if rawThrottle > 1.0 && rawThrottle <= 100.0 {
+                // Some controllers send throttle as 0–100 instead of 0.0–1.0
+                telemetry.throttleOpen = rawThrottle / 100.0
+            } else {
+                // Fallback: derive from speed when throttle register is out of range
+                telemetry.throttleOpen = telemetry.speedKmh <= 0.3 ? 0 : min(1.0, telemetry.speedKmh / 60.0)
+            }
+
+            // Brake state from flags.
             telemetry.brakeActive = (liveFlags & 0x40) != 0
-            telemetry.throttleOpen = telemetry.speedKmh <= 0.3 ? 0 : min(1.0, telemetry.speedKmh / 60.0)
 
             if (liveFlags & 0x10) != 0 {
                 telemetry.mode = .sports
@@ -742,8 +811,21 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 lastStableRideMode = .eco
             }
 
-            // There is no lean sensor confirmed in this frame. Keep lean stable/zero instead of throttle-made lean.
-            telemetry.leanAngle = 0
+            // Lean/tilt: motor angle register (s16(18)) represents the electrical angle count.
+            // Map it to a visual tilt indicator: 0 = upright, positive = right, negative = left.
+            // The zero reference is stored in reg 20 (zeroAngle). Compute relative angle,
+            // then scale to ±45° range for the lean indicator.
+            let zeroRef = telemetry.zeroAngle
+            if zeroRef > 0 {
+                let relative = rawMotor - zeroRef
+                // Electrical angle counts are 0–65535 per revolution; clamp to ±45°
+                let scaled = Double(relative) / 65535.0 * 360.0
+                let clamped = max(-45.0, min(45.0, scaled))
+                // Only show lean when moving; suppress micro-jitter at standstill
+                telemetry.leanAngle = telemetry.speedKmh > 2.0 ? clamped : 0
+            } else {
+                telemetry.leanAngle = 0
+            }
             telemetry.parkingActive = false
             telemetry.reverseActive = false
 
@@ -786,6 +868,58 @@ final class DunenBLEManager: NSObject, ObservableObject {
         return true
     }
 
+    private func decodeProtocolDevBlock(_ data: Data, start: Int) {
+        let b = [UInt8](data)
+        guard b.count >= 5, b[0] == 0x01, b[1] == 0x03 else {
+            protocolDevStatus = "Invalid response"
+            return
+        }
+        let byteCount = Int(b[2])
+        guard b.count >= 3 + byteCount else {
+            protocolDevStatus = "Truncated response"
+            return
+        }
+
+        var words: [ProtocolRegisterWord] = []
+        let wordCount = byteCount / 2
+
+        // Parse as pairs of 16-bit words; group into 32-bit (4-byte) values for U32/IQ16.
+        // Per PDF: address = (row - 2) * 2. Each parameter is 32 bits = two 16-bit registers.
+        // Low word first (big-endian in stream): b[3..4] = reg[0], b[5..6] = reg[1], etc.
+        for i in stride(from: 0, to: wordCount - 1, by: 2) {
+            let o = 3 + i * 2
+            guard o + 3 < b.count else { break }
+            let hiWord = UInt32(b[o]) << 8 | UInt32(b[o + 1])
+            let loWord = UInt32(b[o + 2]) << 8 | UInt32(b[o + 3])
+            let u32 = (hiWord << 16) | loWord
+            // IQ16: integer part in high 16 bits, fractional in low 16 bits. Value = u32 / 65536.
+            let iq16 = Double(Int32(bitPattern: u32)) / 65536.0
+            let paramAddr = start + i  // word-address of this 32-bit parameter pair
+            let w = ProtocolRegisterWord(
+                address: paramAddr,
+                word: Int(hiWord),
+                u32Value: u32,
+                iq16Value: iq16,
+                note: "0x\(String(paramAddr, radix: 16, uppercase: true))"
+            )
+            words.append(w)
+        }
+
+        // Also expose any odd trailing 16-bit word.
+        if wordCount % 2 != 0, let last = words.last {
+            let trailIdx = words.count * 2
+            let o = 3 + trailIdx * 2
+            if o + 1 < b.count {
+                let w16 = Int(UInt16(b[o]) << 8 | UInt16(b[o + 1]))
+                words.append(ProtocolRegisterWord(address: last.address + 2, word: w16, u32Value: nil, iq16Value: nil, note: "u16 only"))
+            }
+        }
+
+        protocolDevRegisters = words
+        protocolDevStatus = "Got \(words.count) params from 0x\(String(start, radix: 16, uppercase: true))"
+        appLogger.log("PROTO-DEV", protocolDevStatus)
+    }
+
     private func decodeGenericFrame(_ data: Data) {
         appLogger.log("RX-IGNORED", "generic frame ignored len=\(data.count)")
     }
@@ -809,9 +943,9 @@ final class DunenBLEManager: NSObject, ObservableObject {
             telemetry.throttleOpen = 0
         }
 
-        // Do NOT calculate lean from throttle/acceleration. No confirmed lean sensor yet.
+        // gForce is not available from BLE telemetry.
         telemetry.gForce = 0
-        telemetry.leanAngle = 0
+        // leanAngle is set by decodeDunenPage; do not override here.
 
         telemetry.theoreticalTopSpeedKmh = 136.0
 
