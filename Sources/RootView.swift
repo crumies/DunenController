@@ -26,6 +26,8 @@ struct RootView: View {
                                 DashboardView()
                             case .advanced:
                                 AdvancedInfoView()
+                            case .protocolDev:
+                                DiagnosticsView()
                             case .tuning:
                                 TuningView()
                             case .diagnostics:
