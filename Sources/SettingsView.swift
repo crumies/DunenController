@@ -50,7 +50,8 @@ struct SettingsView: View {
                             get: { settings.expertTuningUnlocked },
                             set: { newValue in
                                 requestedTuningState = newValue
-                                if newValue { showTuningWarning = true }
+                                if newValue { SoundManager.shared.playWarningSound(enabled: settings.startupSound)
+                        showTuningWarning = true }
                                 else {
                                     settings.expertTuningUnlocked = false
                                     showToast("Tuning locked", "Controller write controls are disabled.", "lock.fill")
@@ -87,7 +88,6 @@ struct SettingsView: View {
                     modernSection("HUD Layout", system: "rectangle.inset.filled") {
                         Toggle("Show kW", isOn: $settings.hudShowKW).tint(.cyan)
                         Toggle("Show temperatures", isOn: $settings.hudShowTemps).tint(.cyan)
-                        Toggle("Show lean card", isOn: $settings.hudShowLeanCard).tint(.cyan)
                         Toggle("Show live graphs", isOn: $settings.hudShowGraphs).tint(.cyan)
                         Toggle("Show lean card", isOn: $settings.hudShowLeanCard).tint(.cyan)
                         Toggle("Show status icons", isOn: $settings.hudShowIcons).tint(.cyan)

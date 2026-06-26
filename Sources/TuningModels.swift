@@ -29,8 +29,8 @@ struct TuningParameter: Identifiable, Codable, Equatable {
     }
 
     static let defaults: [TuningParameter] = [
-        .init(id: 99, internalName: "PIDLLDTorqCurveSet1", displayName: "Side Support Sensor", detail: "Kickstand / side support safety function.", group: .common, kind: .toggle, min: 0, max: 1, currentValue: nil, originalValue: nil, pendingValue: nil, isRisky: true),
-        .init(id: 211, internalName: "FunParm2", displayName: "Anti Sliding Slope", detail: "Rollback prevention / anti sliding slope.", group: .common, kind: .toggle, min: 0, max: 1, currentValue: nil, originalValue: nil, pendingValue: nil, isRisky: true),
-        .init(id: 212, internalName: "FunParm3", displayName: "Cruise Control", detail: "Cruise control enable.", group: .common, kind: .toggle, min: 0, max: 1, currentValue: nil, originalValue: nil, pendingValue: nil, isRisky: true)
+        .init(id: 99, internalName: "PIDLLDTorqCurveSet1", displayName: "Side Support Function", detail: "Kickstand / side support sensor function. 0 = Off, 1 = On.", group: .common, kind: .toggle, min: 0, max: 1, currentValue: nil, originalValue: nil, pendingValue: nil, isRisky: true),
+        .init(id: 211, internalName: "FunParm2", displayName: "Rollback Prevention", detail: "Anti sliding slope / rollback prevention function. 0 = Off, 1 = On.", group: .common, kind: .toggle, min: 0, max: 1, currentValue: nil, originalValue: nil, pendingValue: nil, isRisky: true),
+        .init(id: 212, internalName: "FunParm3", displayName: "Cruise Control", detail: "Cruise control enable. 0 = Off, 1 = On.", group: .common, kind: .toggle, min: 0, max: 1, currentValue: nil, originalValue: nil, pendingValue: nil, isRisky: true)
     ]
 }

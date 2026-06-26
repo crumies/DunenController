@@ -55,10 +55,17 @@ struct ConnectionPill: View {
 
 struct LiquidTabBar: View {
     @Binding var selectedTab: AppTab
+    @EnvironmentObject var settings: AppSettings
+
+    private var visibleTabs: [AppTab] {
+        AppTab.allCases.filter { tab in
+            tab != .protocolDev || settings.controllerAppMode == .development
+        }
+    }
 
     var body: some View {
         HStack(spacing: 4) {
-            ForEach(AppTab.allCases, id: \.rawValue) { tab in
+            ForEach(visibleTabs, id: \.rawValue) { tab in
                 Button {
                     withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) { selectedTab = tab }
                 } label: {

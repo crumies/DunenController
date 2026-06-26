@@ -84,6 +84,7 @@ struct TuningView: View {
                     systemImage: "exclamationmark.triangle.fill",
                     destructive: true,
                     onConfirm: {
+                        SoundManager.shared.playConfirmSound(enabled: settings.startupSound)
                         settings.expertTuningUnlocked = true
                         showUnlock = false
                     },
@@ -103,6 +104,7 @@ struct TuningView: View {
                     systemImage: "slider.horizontal.3",
                     destructive: true,
                     onConfirm: {
+                        SoundManager.shared.playConfirmSound(enabled: settings.startupSound)
                         tuning.updatePending(id: param.id, value: enable ? 1 : 0)
                         pendingToggle = nil
                     },
@@ -121,6 +123,7 @@ struct TuningView: View {
                     systemImage: "square.and.arrow.down.on.square.fill",
                     destructive: true,
                     onConfirm: {
+                        SoundManager.shared.playConfirmSound(enabled: settings.startupSound)
                         ble.writeChangedSettings(tuning.changedParameters)
                         showWriteConfirm = false
                     },
@@ -154,7 +157,10 @@ struct TuningView: View {
                 Text("Press unlock to access safer toggle controls.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Button("Unlock Tuning") { showUnlock = true }
+                Button("Unlock Tuning") {
+                    SoundManager.shared.playWarningSound(enabled: settings.startupSound)
+                    showUnlock = true
+                }
                     .buttonStyle(.borderedProminent)
                     .tint(.orange)
             }

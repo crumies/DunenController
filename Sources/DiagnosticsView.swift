@@ -4,6 +4,7 @@ struct DiagnosticsView: View {
     @EnvironmentObject var ble: DunenBLEManager
     @EnvironmentObject var tuning: TuningStore
     @EnvironmentObject var settings: AppSettings
+    @StateObject private var appLog = AppLogManager.shared
 
     var body: some View {
         ScrollView {
@@ -25,6 +26,9 @@ struct DiagnosticsView: View {
                         row("Connection", ble.connectionStatus)
                         row("Packets", "\(ble.telemetry.packetCount)")
                         row("Update interval", settings.updateInterval.label)
+                        row("BLE Service", "FFE0")
+                        row("Notify/Read", "FFE1")
+                        row("Write", "FFF2")
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -33,15 +37,75 @@ struct DiagnosticsView: View {
                     VStack(spacing: 12) {
                         row("Settings loaded", tuning.didLoadFromController ? "Yes" : "No")
                         row("Tuning unlocked", settings.expertTuningUnlocked ? "Yes" : "No")
-                        row("Demo mode", ble.isDemoMode ? "On" : "Off")
+                        if ble.isDemoMode {
+                            row("Demo mode", "On")
+                        }
                         row("Saved devices", "\(ble.savedDevices.count)")
-                        row("Developer", settings.developerUnlocked ? "Unlocked" : "Locked")
+                        row("Brake", ble.telemetry.brakeActive ? "Active" : "Off")
+                        row("Gear", "\(ble.telemetry.gearInputRaw)")
+                        row("BMS SOC", String(format: "%.0f %%", ble.telemetry.bmsSoc))
+                        row("Confirmed toggles", "99 / 211 / 212")
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
+
+
+                GlassCard {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Export Debug Logs").font(.headline)
+                                Text("Saves BLE TX/RX, parser output, connection events and errors.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                        }
+
+                        HStack(spacing: 10) {
+                            ShareLink(item: appLog.logURL) {
+                                Label("Share TXT", systemImage: "square.and.arrow.up")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.cyan)
+
+                            ShareLink(item: appLog.jsonURL) {
+                                Label("Share JSONL", systemImage: "doc.text")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+
+                        Button(role: .destructive) {
+                            appLog.clear()
+                        } label: {
+                            Label("Clear Log", systemImage: "trash")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+
+                        if appLog.latestLines.isEmpty {
+                            Text("No app logs yet. Connect to the bike, wait 15 seconds, then share TXT.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(appLog.latestLines.prefix(10), id: \.self) { line in
+                                Text(line)
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .lineLimit(2)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
 
                 GlassCard {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Diagnostic History").font(.headline)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         if ble.diagnosticEvents.isEmpty {
                             Text("No events yet").font(.caption).foregroundStyle(.secondary)
                         } else {
@@ -58,6 +122,7 @@ struct DiagnosticsView: View {
                             }
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
                 if settings.showRawPackets {
@@ -83,6 +148,7 @@ struct DiagnosticsView: View {
                 }
             }
             .padding(.horizontal, 18)
+            .frame(maxWidth: .infinity)
             .padding(.top, 10)
             .padding(.bottom, 82)
         }

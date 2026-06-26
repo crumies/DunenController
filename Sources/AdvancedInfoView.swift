@@ -3,6 +3,25 @@ import SwiftUI
 struct AdvancedInfoView: View {
     @EnvironmentObject var ble: DunenBLEManager
 
+    private var estimatedWhPerKm: Double {
+        let speed = max(ble.telemetry.speedKmh, 1.0)
+        let powerW = max(ble.telemetry.powerKw * 1000.0, 0.0)
+
+        // Conservative estimate for heavy-ish 72V e-moto.
+        // Around 42-55 Wh/km cruising, higher when fast/hard acceleration.
+        let live = speed > 10 && powerW > 350 ? powerW / speed : 52.0
+        let speedAdjusted = 40.0 + (speed * 0.45)
+
+        return min(max((live * 0.35) + (speedAdjusted * 0.65), 38.0), 95.0)
+    }
+
+    private var estimatedRangeKm: Double {
+        // 72V * 38.4Ah ≈ 2765Wh. Use 78% usable for realistic riding.
+        let usableWh = 72.0 * 38.4 * 0.78
+        let remainingWh = usableWh * max(0.0, min(100.0, ble.telemetry.batteryPercent)) / 100.0
+        return min(max(remainingWh / max(estimatedWhPerKm, 1.0), 0), 68)
+    }
+
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
@@ -16,6 +35,19 @@ struct AdvancedInfoView: View {
                         row("Power", String(format: "%.1f kW", ble.telemetry.powerKw))
                         row("WarningCode", "\(ble.telemetry.warningCode)")
                         row("ErrCode", "\(ble.telemetry.errorCode)")
+                    }
+                }
+
+                GlassCard {
+                    VStack(spacing: 12) {
+                        row("DUNEN Live Output", "")
+                        row("BMS SOC", String(format: "%.0f %%", ble.telemetry.bmsSoc > 0 ? ble.telemetry.bmsSoc : ble.telemetry.batteryPercent))
+                        row("Gear Input", "\(ble.telemetry.gearInputRaw)")
+                        row("Speed Mode", "\(ble.telemetry.speedModeRaw)")
+                        row("Throttle", String(format: "%.0f %%", ble.telemetry.throttleOpen * 100))
+                        row("Regen Level Est.", ble.telemetry.regenLevel > 0 ? "\(ble.telemetry.regenLevel)" : "Auto")
+                        row("Seat Signal", ble.telemetry.seatSignalActive ? "Active" : "Inactive")
+                        row("Tip-over", ble.telemetry.tipOverActive ? "Active" : "OK")
                     }
                 }
 
@@ -35,6 +67,10 @@ struct AdvancedInfoView: View {
                         row("Voltage Sag", String(format: "%.2f V", ble.telemetry.voltageSag))
                         row("Motor Temp", String(format: "%.1f °C", ble.telemetry.motorTemp))
                         row("Controller Temp", String(format: "%.1f °C", ble.telemetry.controllerTemp))
+                        row("Wh/km Est.", String(format: "%.1f Wh/km", estimatedWhPerKm))
+                        row("Range Est.", String(format: "%.0f km", estimatedRangeKm))
+                        row("5V Rail", String(format: "%.2f V", ble.telemetry.internal5V))
+                        row("12/15V Rail", String(format: "%.2f V", ble.telemetry.internal15V))
                         heatBar(value: ble.telemetry.controllerTemp)
                     }
                 }

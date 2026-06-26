@@ -10,39 +10,42 @@ final class SoundManager {
 
     func playStartupSound(enabled: Bool) {
         guard enabled else { return }
-        play("startup", fallbackID: 1113)
+        play("startup", ext: "mp3", fallbackName: nil, fallbackExt: nil, fallbackID: 1113)
     }
 
     func playScanningSound(enabled: Bool) {
         guard enabled else { return }
-        // Backup/fallback for scanning is different from startup/connect/confirm.
-        play("scanning", fallbackID: 1020)
+        play("scanning", ext: "mp3", fallbackName: "scan_backup", fallbackExt: "wav", fallbackID: 1020)
     }
 
     func playConnectSound(enabled: Bool) {
         guard enabled else { return }
-        play("connected", fallbackID: 1057)
+        play("connected", ext: "mp3", fallbackName: nil, fallbackExt: nil, fallbackID: 1057)
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
 
     func playWarningSound(enabled: Bool = true) {
         guard enabled else { return }
-        play("warning", fallbackID: 1006)
+        play("warning", ext: "mp3", fallbackName: "confirm_backup", fallbackExt: "wav", fallbackID: 1006)
         UINotificationFeedbackGenerator().notificationOccurred(.warning)
     }
 
     func playConfirmSound(enabled: Bool = true) {
         guard enabled else { return }
-        // Backup/fallback for confirmations/popups is unique.
-        play("confirm", fallbackID: 1108)
+        play("confirm", ext: "mp3", fallbackName: "confirm_backup", fallbackExt: "wav", fallbackID: 1110)
         UINotificationFeedbackGenerator().notificationOccurred(.success)
     }
 
-    private func play(_ name: String, fallbackID: SystemSoundID) {
+    private func play(_ name: String, ext: String, fallbackName: String?, fallbackExt: String?, fallbackID: SystemSoundID) {
         player?.stop()
         player = nil
 
-        guard let url = Bundle.main.url(forResource: name, withExtension: "mp3") else {
+        let primary = Bundle.main.url(forResource: name, withExtension: ext)
+        let backup: URL? = {
+            guard let fallbackName, let fallbackExt else { return nil }
+            return Bundle.main.url(forResource: fallbackName, withExtension: fallbackExt)
+        }()
+        guard let url = primary ?? backup else {
             AudioServicesPlaySystemSound(fallbackID)
             return
         }

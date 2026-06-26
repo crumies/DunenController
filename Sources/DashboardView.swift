@@ -67,6 +67,17 @@ struct MetricsCard: View {
     @EnvironmentObject var ble: DunenBLEManager
     let odo: String
 
+    private var gearText: String {
+        if ble.telemetry.mode == .park { return "P" }
+        if ble.telemetry.mode == .reverse { return "R" }
+        switch ble.telemetry.speedModeRaw {
+        case 0: return "ECO"
+        case 1: return "XC"
+        case 2: return "SPORTS"
+        default: return ble.telemetry.mode.rawValue
+        }
+    }
+
     var body: some View {
         GlassCard {
             VStack(spacing: 12) {
@@ -77,6 +88,10 @@ struct MetricsCard: View {
                 HStack {
                     metric("Current", String(format: "%.1f A", ble.telemetry.currentA))
                     metric("Battery", String(format: "%.0f %%", ble.telemetry.batteryPercent))
+                }
+                HStack {
+                    metric("Gear", gearText)
+                    metric("Regen", ble.telemetry.regenLevel > 0 ? "Level \(ble.telemetry.regenLevel)" : "Auto")
                 }
             }
         }
@@ -328,31 +343,71 @@ struct RPMArc: View {
     private let startTrim = 0.12
     private let totalTrim = 0.76
 
+    // Controller/software RPM limits
     var modeLimitRPM: Double {
         switch mode {
         case .eco: return 4000
         case .xc: return 6000
         case .sports: return 8000
-        case .reverse: return 2200
+        case .reverse: return 350
         case .park: return 1000
         }
     }
 
-    var displayMaxRPM: Double {
+    // Realistic road-speed goals per mode.
+    // This changes how much the meter moves in each mode.
+    var realisticTopSpeedKmh: Double {
         switch mode {
-        case .eco: return 5200
-        case .xc: return 7600
-        case .sports: return 9600
-        case .reverse: return 3000
-        case .park: return 1600
+        case .eco: return 65
+        case .xc: return 90
+        case .sports: return 112
+        case .reverse: return 9
+        case .park: return 0
         }
     }
 
+    // RPM that equals the realistic road-speed goal.
+    // Uses Aptum reference: 8000 RPM ≈ 136 km/h wheel-in-air/software top.
+    var realisticTopRPM: Double {
+        switch mode {
+        case .eco: return min(modeLimitRPM, realisticTopSpeedKmh * 8000.0 / 136.0)
+        case .xc: return min(modeLimitRPM, realisticTopSpeedKmh * 8000.0 / 136.0)
+        case .sports: return min(modeLimitRPM, realisticTopSpeedKmh * 8000.0 / 136.0)
+        case .reverse: return 300
+        case .park: return 1000
+        }
+    }
+
+    // Display max has headroom after realistic top so it does not peg.
+    var displayMaxRPM: Double {
+        switch mode {
+        case .eco: return realisticTopRPM + 850
+        case .xc: return realisticTopRPM + 1050
+        case .sports: return realisticTopRPM + 1300
+        case .reverse: return 520
+        case .park: return 1500
+        }
+    }
+
+    // Earlier redline per mode.
     var redlineStartRPM: Double {
         switch mode {
-        case .sports: return max(0, modeLimitRPM - 700)
-        case .reverse: return max(0, modeLimitRPM - 400)
-        default: return max(0, modeLimitRPM - 500)
+        case .eco: return realisticTopRPM * 0.42
+        case .xc: return realisticTopRPM * 0.46
+        case .sports: return realisticTopRPM * 0.50
+        case .reverse: return 55
+        case .park: return 350
+        }
+    }
+
+    // Final danger color appears before realistic top.
+    var fullRedlineRPM: Double {
+        switch mode {
+        case .eco: return realisticTopRPM - 650
+        case .xc: return realisticTopRPM - 750
+        case .sports: return realisticTopRPM - 850
+        case .reverse: return 185
+        case .park: return 700
         }
     }
 
@@ -360,11 +415,55 @@ struct RPMArc: View {
         min(max(Double(rpm) / displayMaxRPM, 0), 0.985)
     }
 
-    var redlineProgress: Double {
-        min(max(redlineStartRPM / displayMaxRPM, 0), 0.985)
+    var stops: [Gradient.Stop] {
+        let start = max(0.01, min(redlineStartRPM / displayMaxRPM, 0.90))
+        let full = max(start + 0.02, min(fullRedlineRPM / displayMaxRPM, 0.95))
+
+        switch mode {
+        case .eco:
+            return [
+                .init(color: .green, location: 0),
+                .init(color: .green, location: start),
+                .init(color: .yellow, location: start + ((full-start) * 0.45)),
+                .init(color: .orange, location: start + ((full-start) * 0.72)),
+                .init(color: .red, location: full),
+                .init(color: .red, location: 1)
+            ]
+        case .xc:
+            return [
+                .init(color: .cyan, location: 0),
+                .init(color: .cyan, location: start),
+                .init(color: .blue, location: start + ((full-start) * 0.42)),
+                .init(color: .purple, location: start + ((full-start) * 0.70)),
+                .init(color: .red, location: full),
+                .init(color: .red, location: 1)
+            ]
+        case .sports:
+            return [
+                .init(color: .orange, location: 0),
+                .init(color: .orange, location: start),
+                .init(color: .red, location: start + ((full-start) * 0.50)),
+                .init(color: Color(red: 0.22, green: 0.0, blue: 0.0), location: start + ((full-start) * 0.75)),
+                .init(color: .black, location: full),
+                .init(color: .black, location: 1)
+            ]
+        case .reverse:
+            return [
+                .init(color: .purple, location: 0),
+                .init(color: .purple, location: start),
+                .init(color: .pink, location: start + ((full-start) * 0.55)),
+                .init(color: .red, location: full),
+                .init(color: .red, location: 1)
+            ]
+        case .park:
+            return [
+                .init(color: .white, location: 0),
+                .init(color: .white.opacity(0.7), location: 1)
+            ]
+        }
     }
 
-    var baseColor: Color {
+    var shadowColor: Color {
         switch mode {
         case .eco: return .green
         case .xc: return .cyan
@@ -374,48 +473,21 @@ struct RPMArc: View {
         }
     }
 
-    var redlineColors: [Color] {
-        switch mode {
-        case .eco:
-            return [.green, .yellow, .orange, .red]
-        case .xc:
-            return [.cyan, .blue, .purple, .red]
-        case .sports:
-            return [.orange, .red, Color(red: 0.22, green: 0.0, blue: 0.0), .black]
-        case .reverse:
-            return [.purple, .pink, .red]
-        case .park:
-            return [.white, .white.opacity(0.75)]
-        }
-    }
-
     var body: some View {
         ZStack {
-            // Track
             Circle()
                 .trim(from: startTrim, to: startTrim + totalTrim)
                 .stroke(.white.opacity(0.10), style: StrokeStyle(lineWidth: 16, lineCap: .round))
                 .rotationEffect(.degrees(90))
 
-            // Normal filled arc. This stays ONLY mode color.
             Circle()
-                .trim(from: startTrim, to: startTrim + min(progress, redlineProgress) * totalTrim)
-                .stroke(baseColor, style: StrokeStyle(lineWidth: 16, lineCap: .round))
+                .trim(from: startTrim, to: startTrim + progress * totalTrim)
+                .stroke(
+                    AngularGradient(gradient: Gradient(stops: stops), center: .center),
+                    style: StrokeStyle(lineWidth: 16, lineCap: .round)
+                )
                 .rotationEffect(.degrees(90))
-                .shadow(color: baseColor.opacity(0.35), radius: 10)
-
-            // Redline filled arc. This is only drawn AFTER redline start,
-            // so the red/orange/black can never show at the beginning.
-            if progress > redlineProgress {
-                Circle()
-                    .trim(from: startTrim + redlineProgress * totalTrim, to: startTrim + progress * totalTrim)
-                    .stroke(
-                        LinearGradient(colors: redlineColors, startPoint: .leading, endPoint: .trailing),
-                        style: StrokeStyle(lineWidth: 16, lineCap: .round)
-                    )
-                    .rotationEffect(.degrees(90))
-                    .shadow(color: .red.opacity(0.34), radius: 11)
-            }
+                .shadow(color: shadowColor.opacity(0.35), radius: 10)
         }
     }
 }
@@ -492,7 +564,7 @@ struct MiniDiagnosticsCard: View {
                 Text("Mini Diagnostics").font(.headline)
                 HStack {
                     stat("Warn", "\(ble.telemetry.warningCode)")
-                    stat("Error", "\(ble.telemetry.errorCode)")
+                    stat("Err", "\(ble.telemetry.errorCode)")
                     stat("Packets", "\(ble.telemetry.packetCount)")
                 }
             }

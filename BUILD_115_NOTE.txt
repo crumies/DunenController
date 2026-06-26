@@ -1,0 +1,12 @@
+Build 115 DISPLAY/RPM/TYPE FIX
+
+Changes:
+- Keeps voltage with 2 decimals in display/logs.
+- Battery estimate: 79.3V -> 80%, 80.2V -> 80%.
+- Adds DUNEN TYPE string: DEMCC2416QS035ZFS01.
+- Sends TYPE ASCII once after connect + version/default read probes.
+- RPM forced 0 when corrected speed is 0.
+- Raw motor count is stored as motorAngle, not used as lean.
+- Lean is no longer calculated from throttle/acceleration.
+- Speed removes the ~4km/h idle baseline, then shows corrected speed.
+- DISPLAY log now includes rawSpeed, rawMotor, flags, type.

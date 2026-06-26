@@ -4,6 +4,7 @@ import SwiftUI
 enum AppTab: String, CaseIterable {
     case dashboard = "Dash"
     case advanced = "Info"
+    case protocolDev = "Protocol"
     case tuning = "Tuning"
     case diagnostics = "Diag"
     case settings = "Settings"
@@ -12,11 +13,18 @@ enum AppTab: String, CaseIterable {
         switch self {
         case .dashboard: return "gauge.with.dots.needle.bottom.50percent"
         case .advanced: return "list.bullet.rectangle"
+        case .protocolDev: return "tablecells"
         case .tuning: return "slider.horizontal.3"
         case .diagnostics: return "waveform.path.ecg.rectangle"
         case .settings: return "gearshape.fill"
         }
     }
+}
+
+enum ControllerAppMode: String, CaseIterable, Identifiable {
+    case standard = "Standard"
+    case development = "Development"
+    var id: String { rawValue }
 }
 
 enum SpeedUnit: String, CaseIterable, Identifiable {
@@ -109,6 +117,8 @@ final class AppSettings: ObservableObject {
     @AppStorage("hudShowDiagnosticsCard") var hudShowDiagnosticsCard: Bool = false
     @AppStorage("hudShowLeanCard") var hudShowLeanCard: Bool = false
     @AppStorage("demoAutoInput") var demoAutoInput: Bool = true
+    @AppStorage("controllerAppMode") var controllerAppModeRaw: String = ControllerAppMode.standard.rawValue
+    @AppStorage("controllerModeSelected") var controllerModeSelected: Bool = false
 
     var speedUnit: SpeedUnit {
         get { SpeedUnit(rawValue: speedUnitRaw) ?? .kmh }
@@ -132,6 +142,23 @@ final class AppSettings: ObservableObject {
         get { UpdateInterval(rawValue: updateIntervalRaw) ?? .tenth }
         set { updateIntervalRaw = newValue.rawValue }
     }
+
+    var controllerAppMode: ControllerAppMode {
+        get { ControllerAppMode(rawValue: controllerAppModeRaw) ?? .standard }
+        set {
+            controllerAppModeRaw = newValue.rawValue
+            controllerModeSelected = true
+        }
+    }
+}
+
+struct ProtocolRegisterWord: Identifiable, Equatable {
+    var id: Int { address }
+    var address: Int
+    var word: Int
+    var u32Value: UInt32?
+    var iq16Value: Double?
+    var note: String
 }
 
 struct Telemetry: Equatable {
@@ -166,6 +193,34 @@ struct Telemetry: Equatable {
     var packetCount: Int = 0
     var productModel: String = "DEMCC2416QS035ZFS01"
     var controllerName: String = "DUNEN312"
+
+    // Real DUNEN BB6D live values from Output/Input/Fault tables
+    var bmsSoc: Double = 0
+    var speedModeRaw: Int = 0
+    var gearInputRaw: Int = 0
+    var gearRaw: Int = 0
+    var throttleOpen: Double = 0
+    var accelTorqueCommand: Double = 0
+    var idleTorqueCommand: Double = 0
+    var slipTorqueCommand: Double = 0
+    var brakeTorqueCommand: Double = 0
+    var hillTorqueCommand: Double = 0
+    var cruiseTorqueCommand: Double = 0
+    var currentTorqueCommand: Double = 0
+    var outputTorque: Double = 0
+    var internal5V: Double = 0
+    var internal15V: Double = 0
+    var runTimeSeconds: Double = 0
+    var runTimeAllSeconds: Double = 0
+    var totalDistanceRaw: Double = 0
+    var seatSignalActive: Bool = false
+    var tipOverActive: Bool = false
+    var pushAssistActive: Bool = false
+    var pushModeActive: Bool = false
+    var antiSlipState: Int = 0
+    var vcuCommand: Int = 0
+    var systemStatus: Int = 0
+    var regenLevel: Int = 0
     var soc: Double {
         batteryPercent
     }
@@ -180,6 +235,20 @@ struct Telemetry: Equatable {
 
     var brakePressed: Bool {
         brakeActive
+    }
+
+    // Aptum reference: Sports mode 8000 RPM ≈ 136 km/h.
+    var sportsRPMToSpeedReferenceKmh: Double {
+        Double(rpm) * 136.0 / 8000.0
+    }
+
+    // Better speed estimate based on real bike reference:
+    // Sports mode: 8000 RPM ≈ 136 km/h.
+    var estimatedSpeedFromRPMKmh: Double {
+        if mode == .reverse {
+            return Double(max(0, rpm)) * 8.5 / 300.0
+        }
+        return Double(max(0, rpm)) * 136.0 / 8000.0
     }
 
 }

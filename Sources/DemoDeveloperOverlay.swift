@@ -8,6 +8,9 @@ struct DemoDeveloperOverlay: View {
     @State private var collapsed = false
 
     var body: some View {
+        if settings.demoAutoInput {
+            EmptyView()
+        } else {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Label("Demo Controls", systemImage: "slider.horizontal.3")
@@ -24,22 +27,16 @@ struct DemoDeveloperOverlay: View {
             }
 
             if !collapsed {
-                if settings.demoAutoInput {
-                    Text("Auto demo input is enabled in Developer Options.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    VStack(alignment: .leading, spacing: 9) {
-                        controlSlider("Throttle", value: $ble.demoThrottle, icon: "bolt.fill")
-                        controlSlider("Brake", value: $ble.demoBrake, icon: "brakesignal")
+                VStack(alignment: .leading, spacing: 9) {
+                    controlSlider("Throttle", value: $ble.demoThrottle, icon: "bolt.fill")
+                    controlSlider("Brake", value: $ble.demoBrake, icon: "brakesignal")
 
-                        Picker("Mode", selection: $ble.demoSelectedMode) {
-                            ForEach(RideMode.allCases) { mode in
-                                Text(mode.rawValue).tag(mode)
-                            }
+                    Picker("Mode", selection: $ble.demoSelectedMode) {
+                        ForEach(RideMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
                         }
-                        .pickerStyle(.segmented)
                     }
+                    .pickerStyle(.segmented)
                 }
             }
         }
@@ -61,6 +58,7 @@ struct DemoDeveloperOverlay: View {
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(.top, 12)
+        }
     }
 
     private func controlSlider(_ title: String, value: Binding<Double>, icon: String) -> some View {

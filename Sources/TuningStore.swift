@@ -28,7 +28,7 @@ final class TuningStore: ObservableObject {
         didLoadFromController = parameters.contains { $0.loaded }
         isReading = false
         statusText = didLoadFromController ? "Loaded current settings" : "No known tuning params found in packet yet"
-        if didLoadFromController { saveBackup(reason: "auto-read") }
+        if didLoadFromController { saveBackup(reason: "manual") }
     }
 
     func updatePending(id: Int, value: Double) {
@@ -48,10 +48,12 @@ final class TuningStore: ObservableObject {
     }
 
     func saveBackup(reason: String) {
+        if reason == "auto-read" { return }
+
         let backup = TuningBackup(date: Date(), reason: reason, parameters: parameters)
         do {
             let data = try JSONEncoder.pretty.encode(backup)
-            let url = documentsDirectory().appendingPathComponent("aptum-settings-backup-\(Int(Date().timeIntervalSince1970)).json")
+            let url = documentsDirectory().appendingPathComponent("aptum-settings-backup-manual-\(Int(Date().timeIntervalSince1970)).json")
             try data.write(to: url)
             lastBackupURL = url
         } catch {
