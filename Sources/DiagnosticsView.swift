@@ -9,6 +9,7 @@ struct DiagnosticsView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
+                RegisterProbeCard()
                 HStack {
                     VStack(alignment: .leading) {
                         Text("Diagnostics").font(.largeTitle.weight(.heavy))
@@ -162,3 +163,94 @@ struct DiagnosticsView: View {
         }
     }
 }
+
+struct RegisterProbeCard: View {
+    @EnvironmentObject var ble: DunenBLEManager
+
+    // Known useful register blocks with descriptions
+    private let knownBlocks: [(label: String, start: Int, count: Int)] = [
+        ("Live dashboard (0x0400, 24 regs)", 0x0400, 24),
+        ("Speed OVechSpd (362, 12 params)", 362, 24),
+        ("Voltage/5V/15V (338, 12 params)",  338, 24),
+        ("Current IADin9 (266, 12 params)",  266, 24),
+        ("Torque OTorq (314, 12 params)",    314, 24),
+        ("Fault/warn (410, 12 params)",       410, 24),
+    ]
+
+    @State private var startText = "362"
+    @State private var countText = "24"
+
+    var body: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Register Probe").font(.headline)
+                Text("Read any register block and see raw 32-bit values. Use this to find what the controller actually sends.")
+                    .font(.caption).foregroundStyle(.secondary)
+
+                // Quick-pick known blocks
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(knownBlocks, id: \.start) { block in
+                            Button(block.label) {
+                                startText = "\(block.start)"
+                                countText = "\(block.count)"
+                            }
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(.cyan.opacity(0.12))
+                            .clipShape(Capsule())
+                        }
+                    }
+                }
+
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Start address").font(.caption2).foregroundStyle(.secondary)
+                        TextField("e.g. 362", text: $startText)
+                            .keyboardType(.numberPad)
+                            .padding(8)
+                            .background(.white.opacity(0.07))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Count (16-bit)").font(.caption2).foregroundStyle(.secondary)
+                        TextField("e.g. 24", text: $countText)
+                            .keyboardType(.numberPad)
+                            .padding(8)
+                            .background(.white.opacity(0.07))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                    Button {
+                        let start = Int(startText) ?? 362
+                        let count = Int(countText) ?? 24
+                        ble.probeRegister(start: start, count: count)
+                    } label: {
+                        if ble.probeInFlight {
+                            ProgressView().tint(.cyan)
+                        } else {
+                            Text("Send").bold()
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.cyan)
+                    .disabled(ble.probeInFlight || !ble.isConnected)
+                }
+
+                if !ble.probeResult.isEmpty {
+                    ScrollView {
+                        Text(ble.probeResult)
+                            .font(.system(size: 10, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                    .frame(maxHeight: 280)
+                    .padding(10)
+                    .background(.black.opacity(0.3))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+            }
+        }
+    }
+}
+

@@ -40,8 +40,10 @@ final class DunenBLEManager: NSObject, ObservableObject {
     private var pollFrames: [(start: Int, data: Data)] = []
     private var pollIndex: Int = 0
     private var pendingReadStarts: [Int] = []
-    private var inFlightReadStart: Int?
+    private var inFlightReadStart: Int?        // for 0x0400 live frame only
     private var inFlightSentAt: Date?
+    private var outInFlightStart: Int?          // for output register block polls
+    private var outInFlightSentAt: Date?
     private var lastDecodedStart: Int?
     private var bootScanDone: Bool = false
     private var didSendLiveEnable: Bool = false
@@ -56,6 +58,12 @@ final class DunenBLEManager: NSObject, ObservableObject {
     private var zeroToFiftyRunning = false
     private var zeroToFiftyStart: Date?
     private var pollTimer: Timer?
+    private var outputPollTimer: Timer?         // separate slower timer for reg blocks
+
+    // Register probe result published to UI
+    @Published var probeResult: String = ""
+    @Published var probeInFlight: Bool = false
+    private var probeInFlightStart: Int?
 
     private let serviceFFE0 = CBUUID(string: "FFE0")
     private let characteristicFFE1 = CBUUID(string: "FFE1")
@@ -245,6 +253,8 @@ final class DunenBLEManager: NSObject, ObservableObject {
         pendingReadStarts.removeAll()
         inFlightReadStart = nil
         inFlightSentAt = nil
+        outInFlightStart = nil
+        outInFlightSentAt = nil
         lastDecodedStart = nil
         bootScanDone = true
         didSendLiveEnable = false
@@ -254,26 +264,25 @@ final class DunenBLEManager: NSObject, ObservableObject {
         liveProbeTick = 0
         outputPollIdx = 0
 
-        // Build 105:
-        // DUNEN does NOT continuously show the live values just from normal table reads.
-        // The official app enables AC/live debug using a 0x10 write to 0x03E8, then the
-        // controller pushes live 0x03/0x30 notifications. We now do the same and parse
-        // live notifications by shape, not only by pending request start.
         pollFrames = [
             (0x0418, DunenProtocol.modbusReadFrame(start: 0x0418, count: 0x0002)),
             (0x0400, DunenProtocol.modbusReadFrame(start: 0x0400, count: 0x0018))
         ]
 
-        let interval = 0.35
-        appLogger.log("POLL", "Starting Build105 LIVE NOTIFY ENABLE interval=\(interval)s")
-
-        pollTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+        // Fast timer: only 0x0400 live frame
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
             guard let self else { return }
-            DispatchQueue.main.async {
-                self.requestLiveOutput()
-            }
+            DispatchQueue.main.async { self.requestLiveOutput() }
         }
         pollTimer?.fire()
+
+        // Slower separate timer: output register blocks (362/338/266/314)
+        // Runs on its own in-flight tracker so it never clashes with the 0x0400 poll.
+        outputPollTimer = Timer.scheduledTimer(withTimeInterval: 0.9, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            DispatchQueue.main.async { self.requestOutputBlock() }
+        }
+        appLogger.log("POLL", "Started live=0.35s outputBlock=0.9s")
     }
 
     private var didSendDunenTypeReads: Bool = false
@@ -413,11 +422,11 @@ final class DunenBLEManager: NSObject, ObservableObject {
         }
     }
 
-    // Output register blocks polled in round-robin every 2 live ticks.
-    // 362 first (speed) so it gets freshest data; others follow.
-    private let outputPollStarts = [362, 338, 362, 266, 362, 314]
+    // Output register blocks cycled in order: speed first, then voltage/rails, current, torque.
+    private let outputPollStarts = [362, 338, 266, 314]
     private var outputPollIdx = 0
 
+    /// Fast 0x0400 live frame poll — only handles the live dashboard frame.
     private func requestLiveOutput() {
         guard isConnected, let p = connectedPeripheral else { return }
 
@@ -432,33 +441,59 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         if let start = inFlightReadStart {
             let age = Date().timeIntervalSince(inFlightSentAt ?? Date())
-            if age < 0.45 { return }
-            appLogger.log("POLL-TIMEOUT", "Dropping in-flight start=0x\(String(start, radix: 16))")
+            if age < 0.5 { return }
+            appLogger.log("POLL-TIMEOUT", "Dropping live in-flight 0x\(String(start, radix: 16))")
             inFlightReadStart = nil
             inFlightSentAt = nil
         }
 
+        let frame = DunenProtocol.modbusReadFrame(start: 0x0400, count: 0x0018)
+        inFlightReadStart = 0x0400
+        inFlightSentAt = Date()
+        developerStatus = "Live 0x0400"
         let target = notifyCharacteristic ?? secondaryWriteCharacteristic ?? writeCharacteristic
-
-        // Every 2 ticks poll one output register block in round-robin (speed, voltage, current, torque).
-        // Speed (362) appears first in the list so it gets polled most frequently.
-        if liveProbeTick % 2 == 0 {
-            let start = outputPollStarts[outputPollIdx % outputPollStarts.count]
-            outputPollIdx += 1
-            let frame = DunenProtocol.modbusReadFrame(start: start, count: 24)
-            inFlightReadStart = start
-            inFlightSentAt = Date()
-            developerStatus = "Polling reg \(start)"
-            sendReadOnlyFrame(frame, via: target, peripheral: p, note: "output-block start=\(start)")
-        } else {
-            // Main live dashboard frame.
-            let frame = DunenProtocol.modbusReadFrame(start: 0x0400, count: 0x0018)
-            inFlightReadStart = 0x0400
-            inFlightSentAt = Date()
-            developerStatus = "Live 0x0400 polling"
-            sendReadOnlyFrame(frame, via: target, peripheral: p, note: "live-only start=0x400")
-        }
+        sendReadOnlyFrame(frame, via: target, peripheral: p, note: "live start=0x400")
         liveProbeTick += 1
+    }
+
+    /// Slower output register block poll — uses its own in-flight tracker, never touches inFlightReadStart.
+    private func requestOutputBlock() {
+        guard isConnected, let p = connectedPeripheral else { return }
+
+        if let start = outInFlightStart {
+            let age = Date().timeIntervalSince(outInFlightSentAt ?? Date())
+            if age < 1.2 {
+                appLogger.log("OUT-POLL", "Still waiting for reg \(start) response")
+                return
+            }
+            appLogger.log("OUT-POLL-TIMEOUT", "Dropping output block reg \(start)")
+            outInFlightStart = nil
+            outInFlightSentAt = nil
+        }
+
+        let start = outputPollStarts[outputPollIdx % outputPollStarts.count]
+        outputPollIdx += 1
+        let frame = DunenProtocol.modbusReadFrame(start: start, count: 24)
+        outInFlightStart = start
+        outInFlightSentAt = Date()
+        appLogger.log("OUT-POLL", "Requesting reg \(start) count=24")
+        let target = notifyCharacteristic ?? secondaryWriteCharacteristic ?? writeCharacteristic
+        sendReadOnlyFrame(frame, via: target, peripheral: p, note: "output-block reg=\(start)")
+    }
+
+    /// Send a one-shot Modbus read for any register range. Result shows in probeResult.
+    func probeRegister(start: Int, count: Int) {
+        guard isConnected, let p = connectedPeripheral else {
+            probeResult = "Not connected"
+            return
+        }
+        probeInFlight = true
+        probeInFlightStart = start
+        probeResult = "Waiting for reg \(start)…"
+        let frame = DunenProtocol.modbusReadFrame(start: start, count: count)
+        let target = notifyCharacteristic ?? secondaryWriteCharacteristic ?? writeCharacteristic
+        appLogger.log("PROBE", "Sending probe reg=\(start) count=\(count)")
+        sendReadOnlyFrame(frame, via: target, peripheral: p, note: "probe reg=\(start) count=\(count)")
     }
 
     private func sendReadOnlyFrame(_ data: Data, via characteristic: CBCharacteristic?, peripheral: CBPeripheral, note: String = "readOnly") {
@@ -472,6 +507,8 @@ final class DunenBLEManager: NSObject, ObservableObject {
     private func stopPollTimer() {
         pollTimer?.invalidate()
         pollTimer = nil
+        outputPollTimer?.invalidate()
+        outputPollTimer = nil
     }
 
     private func startDemoTimer() {
@@ -596,43 +633,63 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         let isModbusRead = data.count >= 3 && data[0] == 0x01 && data[1] == 0x03
 
-        // Build114 robust live decode: 0x0400 can arrive as response or notification.
+        // 0x0400 live frame check — identified by shape (voltage + temp ranges).
         if isDunenLive0400Frame(data) {
             lastLiveNotifyAt = Date()
             inFlightReadStart = nil
             inFlightSentAt = nil
-            appLogger.log("PARSER", "Build114 robust live decode 0x400 len=\(data.count)")
+            appLogger.log("PARSER", "live 0x400 len=\(data.count)")
             _ = decodeDunenPage(data, expectedStart: 0x0400)
             return
         }
 
-
-        // Important: DUNEN live frames arrive as notifications and do not include
-        // the start register. Detect them by shape and decode as 0x0400.
-        if isDunenLive0400Frame(data) {
-            lastLiveNotifyAt = Date()
-            if inFlightReadStart == 0x0400 { inFlightReadStart = nil; inFlightSentAt = nil }
-            appLogger.log("PARSER", "liveNotify matchedStart=0x400 len=\(data.count)")
-            _ = decodeDunenPage(data, expectedStart: 0x0400)
+        guard isModbusRead else {
+            decodeGenericFrame(data)
             return
         }
 
-        if isModbusRead {
-            guard let expectedStart = inFlightReadStart else {
-                appLogger.log("RX-UNMATCHED", "0x03 response with no in-flight request len=\(data.count) hex=\(hex)")
-                return
+        // Route the response to whoever sent the request.
+        // Priority: live (inFlightReadStart) → output block (outInFlightStart) → probe (probeInFlightStart)
+        if let start = inFlightReadStart {
+            inFlightReadStart = nil
+            inFlightSentAt = nil
+            appLogger.log("PARSER", "live-resp start=0x\(String(start, radix: 16)) len=\(data.count)")
+            _ = decodeDunenPage(data, expectedStart: start)
+            return
+        }
+
+        if let start = outInFlightStart {
+            outInFlightStart = nil
+            outInFlightSentAt = nil
+            appLogger.log("PARSER", "output-block resp start=\(start) len=\(data.count)")
+            _ = decodeDunenPage(data, expectedStart: start)
+            return
+        }
+
+        if let start = probeInFlightStart {
+            probeInFlightStart = nil
+            probeInFlight = false
+            // Build human-readable dump of all 32-bit values in the block
+            let b = [UInt8](data)
+            let byteCount = b.count >= 3 ? Int(b[2]) : 0
+            var lines: [String] = ["Reg\t16-bit words\t32-bit value"]
+            var offset = 3
+            var regAddr = start
+            while offset + 3 < b.count - 2 && offset + 3 < 3 + byteCount {
+                let hi = Int(b[offset]) << 8 | Int(b[offset+1])
+                let lo = Int(b[offset+2]) << 8 | Int(b[offset+3])
+                let raw32 = Int32(bitPattern: (UInt32(hi) << 16) | UInt32(lo))
+                let iq16 = Double(raw32) / 65536.0
+                lines.append("\(regAddr)\t\(hi) \(lo)\t\(raw32) (IQ16=\(String(format:"%.4f",iq16)))")
+                regAddr += 2
+                offset += 4
             }
-
-            inFlightReadStart = nil
-            inFlightSentAt = nil
-            lastDecodedStart = expectedStart
-
-            appLogger.log("PARSER", "matchedStart=0x\(String(expectedStart, radix: 16)) len=\(data.count)")
-            _ = decodeDunenPage(data, expectedStart: expectedStart)
+            probeResult = lines.joined(separator: "\n")
+            appLogger.log("PROBE", "result for start=\(start): \(probeResult)")
             return
         }
 
-        decodeGenericFrame(data)
+        appLogger.log("RX-UNMATCHED", "0x03 response no in-flight request len=\(data.count) hex=\(hex)")
     }
 
     private func decodeDunenPage(_ data: Data, expectedStart: Int) -> Bool {
