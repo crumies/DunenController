@@ -1,0 +1,23 @@
+Build 115 DISPLAY/RPM/TYPE FIX
+
+Changes:
+- Keeps voltage with 2 decimals in display/logs.
+- Battery estimate: 79.3V -> 80%, 80.2V -> 80%.
+- Adds DUNEN TYPE string: DEMCC2416QS035ZFS01.
+- Sends TYPE ASCII once after connect + version/default read probes.
+- RPM forced 0 when corrected speed is 0.
+- Raw motor count is stored as motorAngle, not used as lean.
+- Lean is no longer calculated from throttle/acceleration.
+- Speed removes the ~4km/h idle baseline, then shows corrected speed.
+- DISPLAY log now includes rawSpeed, rawMotor, flags, type.
+
+Build 116 REGISTER FIX:
+- Speed now read from OVechSpd (reg 362), not derived from motor RPM.
+- Voltage now read from OVkey (reg 343) with fallback to live 0x0400 frame.
+- Battery % calculated from proper 20s pack SOC curve (84V=100%, 60V=0%).
+- Current now read from IADin9 (reg 282) analog sample.
+- Torque now read from OTorq (reg 321, scale /10000).
+- Internal 5V rail read from OVMon5V (reg 344).
+- Internal 15V rail read from OVMon15V (reg 345).
+- Park/Reverse now detected from live flags bits (0x01=park, 0x04=reverse).
+- Poll timer round-robins output register blocks every 4 ticks.

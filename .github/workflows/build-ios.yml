@@ -1,0 +1,67 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clean generated files
+        run: |
+          rm -rf AptumDashboard.xcodeproj
+          rm -rf DunenDashboard.xcodeproj
+          rm -rf build Payload
+          rm -f AptumDashboard.ipa DunenDashboard.ipa
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: |
+          xcodegen generate --spec project.yml
+          ls -la
+          ls -la AptumDashboard.xcodeproj
+
+      - name: Build app
+        run: |
+          xcodebuild clean build \
+            -project AptumDashboard.xcodeproj \
+            -scheme AptumDashboard \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            -derivedDataPath build
+
+      - name: Verify bundled sounds
+        run: |
+          find build -name "*.mp3" -print || true
+
+      - name: Create IPA
+        run: |
+          rm -rf Payload
+          rm -f AptumDashboard.ipa
+          APP_PATH="build/Build/Products/Release-iphoneos/AptumDashboard.app"
+          test -d "$APP_PATH"
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/AptumDashboard.app
+          /usr/bin/zip -r AptumDashboard.ipa Payload
+          ls -lh AptumDashboard.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: AptumDashboard-IPA
+          path: AptumDashboard.ipa
