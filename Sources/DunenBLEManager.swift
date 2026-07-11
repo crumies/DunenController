@@ -742,10 +742,15 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.bmsSoc = telemetry.batteryPercent
             }
 
-            // Speed: IQ16 at u16 indices 4 (frac) and 5 (int)
-            let rawSpeed = fixedIntFrac(4, 5)
-            if rawSpeed >= 0 && rawSpeed <= 200 {
-                telemetry.speedKmh = rawSpeed < 0.5 ? 0 : (rawSpeed * 10.0).rounded() / 10.0
+            // Speed field is motor RPM (IQ16 at u16 indices 4/5).
+            // Convert to km/h using gearing: circumference × 60 / 1000 / driveRatio.
+            let motorRPM = fixedIntFrac(4, 5)
+            telemetry.rpm = motorRPM > 5 ? Int(motorRPM.rounded()) : 0
+            if motorRPM <= 5 {
+                telemetry.speedKmh = 0
+            } else {
+                let kmh = motorRPM * kmhPerMotorRPM
+                telemetry.speedKmh = (kmh * 10.0).rounded() / 10.0
             }
 
             let controllerT = fixedIntFrac(6, 7)
@@ -775,14 +780,8 @@ final class DunenBLEManager: NSObject, ObservableObject {
             telemetry.motorAngle = rawMotor
             telemetry.zeroAngle = u16(20)
 
-            // RPM estimated from vehicle speed + gearing
-            if telemetry.speedKmh <= 0.3 {
-                telemetry.rpm = 0
-                telemetry.wheelRPM = 0
-            } else {
-                telemetry.rpm = Int(round(telemetry.speedKmh * motorRPMPerKmh))
-                telemetry.wheelRPM = Double(telemetry.rpm) / finalDriveRatio
-            }
+            // wheelRPM derived from motor RPM and drive ratio
+            telemetry.wheelRPM = telemetry.rpm > 0 ? Double(telemetry.rpm) / finalDriveRatio : 0
 
             // Throttle/brake state from flags.
             telemetry.brakeActive = (liveFlags & 0x40) != 0
