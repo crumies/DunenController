@@ -327,6 +327,9 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
     private func isDunenLive0400Frame(_ data: Data) -> Bool {
         let b = [UInt8](data)
+        // 0x0400 live frame is exactly 0x30 (48) payload bytes = 53 total.
+        // Output register blocks (266,314,338,362) are also 24 regs = 0x30 bytes —
+        // disambiguate by requiring BOTH temps to be in a realistic range (5–120°C).
         guard b.count >= 53, b[0] == 0x01, b[1] == 0x03, b[2] == 0x30 else { return false }
 
         func u16(_ index: Int) -> Int {
@@ -340,14 +343,12 @@ final class DunenBLEManager: NSObject, ObservableObject {
         }
 
         let voltage = fixed(2, 3)
-        let speed = fixed(4, 5)
         let controllerT = fixed(6, 7)
         let motorT = fixed(8, 9)
 
-        // Real live frames from DUNEN look like:
-        // voltage 70-90, speed 0-160, controller temp 5-120, motor temp 5-120.
+        // Require voltage in range AND both temps realistic to avoid misidentifying
+        // output register poll responses (reg 266/314/338/362) as 0x0400.
         return voltage >= 45 && voltage <= 95 &&
-               speed >= 0 && speed <= 160 &&
                controllerT >= 5 && controllerT <= 120 &&
                motorT >= 5 && motorT <= 120
     }
@@ -700,13 +701,16 @@ final class DunenBLEManager: NSObject, ObservableObject {
             // Throttle/brake state from flags.
             telemetry.brakeActive = (liveFlags & 0x40) != 0
 
-            // Park / Reverse from live flags (bits 0x01 = park, 0x04 = reverse).
+            // Park / Reverse from live flags.
+            // Confirmed: 0x04 = reverse. Park bit is not confirmed — detect by
+            // flags == 0 (no drive mode bits set) when speed is already 0.
             if (liveFlags & 0x04) != 0 {
                 telemetry.mode = .reverse
                 telemetry.reverseActive = true
                 telemetry.parkingActive = false
                 lastStableRideMode = .reverse
-            } else if (liveFlags & 0x01) != 0 {
+            } else if liveFlags == 0 || (liveFlags & 0x20) != 0 {
+                // flags == 0 or explicit park bit: vehicle is in park
                 telemetry.mode = .park
                 telemetry.parkingActive = true
                 telemetry.reverseActive = false
@@ -745,10 +749,12 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.batteryPercent = liIonSoc20s(telemetry.voltage)
                 telemetry.bmsSoc = telemetry.batteryPercent
             }
-            let mon5v = Double(regs[safe: 6] ?? 0) / 100.0
-            if mon5v > 0 { telemetry.internal5V = mon5v }
-            let mon15v = Double(regs[safe: 7] ?? 0) / 100.0
-            if mon15v > 0 { telemetry.internal15V = mon15v }
+            // OVMon5V / OVMon15V: raw value is in mV*10 units, divide by 10000 to get volts.
+            // e.g. raw 51700 → 5.17V, raw 150000 → 15.0V
+            let mon5v = Double(regs[safe: 6] ?? 0) / 10000.0
+            if mon5v > 0.5 && mon5v < 7.0 { telemetry.internal5V = mon5v }
+            let mon15v = Double(regs[safe: 7] ?? 0) / 10000.0
+            if mon15v > 0.5 && mon15v < 20.0 { telemetry.internal15V = mon15v }
 
         case 266:
             // Block 266–289: IADin9 (282) = current, index = 282 - 266 = 16
