@@ -769,12 +769,12 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
             let controllerT = fixedIntFrac(6, 7)
             if controllerT >= 5 && controllerT <= 120 {
-                telemetry.controllerTemp = floor(controllerT)
+                telemetry.controllerTemp = (controllerT * 10.0).rounded() / 10.0
             }
 
             let motorT = fixedIntFrac(8, 9)
             if motorT >= 5 && motorT <= 120 {
-                telemetry.motorTemp = floor(motorT)
+                telemetry.motorTemp = (motorT * 10.0).rounded() / 10.0
             }
 
             // Current: IQ16 at indices 10/11. Use abs — can be negative during regen.

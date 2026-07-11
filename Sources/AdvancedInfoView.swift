@@ -30,7 +30,7 @@ struct AdvancedInfoView: View {
                 GlassCard(glow: true) {
                     VStack(spacing: 12) {
                         row("RPM", "\(ble.telemetry.rpm)")
-                        row("Voltage", String(format: "%.1f V", ble.telemetry.voltage))
+                        row("Voltage", String(format: "%.2f V", ble.telemetry.voltage))
                         row("Current", String(format: "%.1f A", ble.telemetry.currentA))
                         row("Power", String(format: "%.1f kW", ble.telemetry.powerKw))
                         row("WarningCode", "\(ble.telemetry.warningCode)")

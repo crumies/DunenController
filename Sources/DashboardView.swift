@@ -82,7 +82,7 @@ struct MetricsCard: View {
         GlassCard {
             VStack(spacing: 12) {
                 HStack {
-                    metric("Voltage", String(format: "%.1f V", ble.telemetry.voltage))
+                    metric("Voltage", String(format: "%.2f V", ble.telemetry.voltage))
                     metric("Odometer", odo)
                 }
                 HStack {
@@ -138,9 +138,9 @@ struct HUDBlock: View {
 
                     if settings.hudShowTemps {
                         HStack {
-                            statusIcon("cpu", String(format: "%.0f°C", ble.telemetry.controllerTemp))
+                            statusIcon("cpu", String(format: "%.1f°C", ble.telemetry.controllerTemp))
                             Spacer()
-                            motorTempIcon(String(format: "%.0f°C", ble.telemetry.motorTemp))
+                            motorTempIcon(String(format: "%.1f°C", ble.telemetry.motorTemp))
                             Spacer()
                             statusIcon("battery.75percent", String(format: "%.0f%%", ble.telemetry.batteryPercent))
                         }
@@ -512,7 +512,7 @@ struct GraphPanel: View {
 
                 graphRow("Speed", value: String(format: "%.0f %@", settings.speedUnit == .kmh ? ble.telemetry.speedKmh : ble.telemetry.speedKmh * 0.621371, settings.speedUnit.rawValue), values: ble.history.speed, max: 120)
                 graphRow("RPM", value: "\(ble.telemetry.rpm) rpm", values: ble.history.rpm, max: 9000)
-                graphRow("Voltage", value: String(format: "%.1f V", ble.telemetry.voltage), values: ble.history.voltage, max: 90)
+                graphRow("Voltage", value: String(format: "%.2f V", ble.telemetry.voltage), values: ble.history.voltage, max: 90)
                 graphRow("Current", value: String(format: "%.1f A", ble.telemetry.currentA), values: ble.history.current, max: 140)
             }
         }
