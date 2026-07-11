@@ -635,9 +635,10 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         let isModbusRead = data.count >= 3 && data[0] == 0x01 && data[1] == 0x03
 
-        // Output block response must be checked FIRST — reg 338 is also 0x30 bytes and
-        // would be misidentified as a live 0x0400 frame by the shape check below.
-        if isModbusRead, let start = outInFlightStart {
+        // Output block response: only claim it when byteCount matches the expected 0x30
+        // (24 registers × 2 bytes). This prevents stealing tuning reads or live frames.
+        let byteCount3 = data.count >= 3 ? Int(data[2]) : 0
+        if isModbusRead, byteCount3 == 0x30, let start = outInFlightStart {
             outInFlightStart = nil
             outInFlightSentAt = nil
             appLogger.log("PARSER", "output-block resp start=\(start) len=\(data.count)")
@@ -796,15 +797,15 @@ final class DunenBLEManager: NSObject, ObservableObject {
             telemetry.brakeActive = (liveFlags & 0x40) != 0
 
             // Park / Reverse from live flags.
-            // Confirmed: 0x04 = reverse. Park bit is not confirmed — detect by
-            // flags == 0 (no drive mode bits set) when speed is already 0.
-            if (liveFlags & 0x04) != 0 {
+            // Guard reverse: only accept if RPM is low (reverse is slow, < 400 RPM).
+            // Guard park: only accept if speed AND rpm are both near zero.
+            if (liveFlags & 0x04) != 0 && telemetry.rpm < 400 {
                 telemetry.mode = .reverse
                 telemetry.reverseActive = true
                 telemetry.parkingActive = false
                 lastStableRideMode = .reverse
-            } else if liveFlags == 0 || (liveFlags & 0x20) != 0 {
-                // flags == 0 or explicit park bit: vehicle is in park
+            } else if (liveFlags == 0 || (liveFlags & 0x20) != 0) && telemetry.speedKmh < 1.0 && telemetry.rpm < 50 {
+                // Only park when actually stationary — prevents noise triggering park mode.
                 telemetry.mode = .park
                 telemetry.parkingActive = true
                 telemetry.reverseActive = false
