@@ -347,8 +347,9 @@ final class DunenBLEManager: NSObject, ObservableObject {
             return Int(UInt16(b[o]) << 8 | UInt16(b[o + 1]))
         }
 
-        func fixed(_ frac: Int, _ whole: Int) -> Double {
-            Double(Int16(bitPattern: UInt16(u16(whole)))) + Double(u16(frac)) / 65536.0
+        // int=even index, frac=odd index (PDF confirmed: high word = integer)
+        func fixed(_ int: Int, _ frac: Int) -> Double {
+            Double(Int16(bitPattern: UInt16(u16(int)))) + Double(u16(frac)) / 65536.0
         }
 
         let voltage = fixed(2, 3)
@@ -635,6 +636,21 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         let isModbusRead = data.count >= 3 && data[0] == 0x01 && data[1] == 0x03
 
+        guard isModbusRead else {
+            decodeGenericFrame(data)
+            return
+        }
+
+        // Output block responses must be routed FIRST — before the live-frame shape check —
+        // because reg 338 response is also 0x30 bytes and would be misidentified as 0x0400.
+        if let start = outInFlightStart {
+            outInFlightStart = nil
+            outInFlightSentAt = nil
+            appLogger.log("PARSER", "output-block resp start=\(start) len=\(data.count)")
+            _ = decodeDunenPage(data, expectedStart: start)
+            return
+        }
+
         // 0x0400 live frame: must be exactly 53 bytes (byteCount=0x30) AND pass shape check.
         if isDunenLive0400Frame(data) {
             lastLiveNotifyAt = Date()
@@ -645,14 +661,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
             return
         }
 
-        guard isModbusRead else {
-            decodeGenericFrame(data)
-            return
-        }
-
-        // Route the response to whoever sent the request.
-        // For the live 0x0400 slot: only accept if byteCount==0x30 (48 bytes = 24 u16 regs).
-        // Reject short/wrong-size responses so firmware strings don't get decoded as telemetry.
+        // Route the live 0x0400 in-flight request.
         if let start = inFlightReadStart {
             let b2 = [UInt8](data)
             let bc = b2.count >= 3 ? Int(b2[2]) : 0
@@ -665,14 +674,6 @@ final class DunenBLEManager: NSObject, ObservableObject {
             inFlightReadStart = nil
             inFlightSentAt = nil
             appLogger.log("PARSER", "live-resp start=0x\(String(start, radix: 16)) len=\(data.count)")
-            _ = decodeDunenPage(data, expectedStart: start)
-            return
-        }
-
-        if let start = outInFlightStart {
-            outInFlightStart = nil
-            outInFlightSentAt = nil
-            appLogger.log("PARSER", "output-block resp start=\(start) len=\(data.count)")
             _ = decodeDunenPage(data, expectedStart: start)
             return
         }
@@ -721,11 +722,11 @@ final class DunenBLEManager: NSObject, ObservableObject {
             Int(Int16(bitPattern: UInt16(u16(index))))
         }
 
-        func fixedIntFrac(_ fracIndex: Int, _ intIndex: Int) -> Double {
-            // DUNEN live 0x0400 uses: low word = fractional / 65536, next word = integer.
-            // Example from real DUNEN log:
-            // reg1026=66 reg1027=80 => ~80.001V
-            // reg1030=41759 reg1031=30 => ~30.637C
+        func fixedIntFrac(_ intIndex: Int, _ fracIndex: Int) -> Double {
+            // PDF example 1.3.1: 0x05DC0000 / 65536 = 1500 — integer is in HIGH word.
+            // Frame byte order: high word first (big-endian 32-bit).
+            // So for a pair at positions n, n+1: u16(n)=high=integer, u16(n+1)=low=fraction.
+            // reg1026=66, reg1027=80 => voltage = 66 + 80/65536 = ~66V (72V pack, makes sense).
             Double(s16(intIndex)) + (Double(u16(fracIndex)) / 65536.0)
         }
 
@@ -746,13 +747,12 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 appLogger.log("PARSER", "0x0400 frame too short byteCount=\(byteCount) — skipped")
                 return false
             }
-            // Frame layout: 12 × 32-bit IQ16 params, each = u16(even)=frac, u16(odd)=int.
-            // Param 0 = u16(0)/u16(1): status word. Per PDF appendix, live flags are in
-            // the low word of param 0 = u16(1).
-            let liveFlags = u16(1)
+            // Live flags come from u16(2) — confirmed working in earlier builds.
+            let liveFlags = u16(2)
             lastLiveFlags = liveFlags
 
-            // Voltage: IQ16 at u16 indices 2 (frac) and 3 (int)
+            // Voltage: IQ16, int=u16(2), frac=u16(3). PDF: high word = integer.
+            // reg1026=66(int), reg1027=80(frac) => 66 + 80/65536 = ~66V on a 72V pack. ✓
             let voltage = fixedIntFrac(2, 3)
             if voltage >= 45 && voltage <= 95 {
                 telemetry.voltage = (voltage * 100.0).rounded() / 100.0
@@ -760,9 +760,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.bmsSoc = telemetry.batteryPercent
             }
 
-            // Motor RPM: IQ16 at u16 indices 4 (frac) and 5 (int).
-            // Same layout as voltage (frac=even, int=odd), confirmed by PDF + log examples.
-            // Controller sends motor shaft RPM; convert to km/h via chain gearing.
+            // Motor RPM: IQ16, int=u16(4), frac=u16(5).
             let motorRPM = abs(fixedIntFrac(4, 5))
             telemetry.rpm = motorRPM >= 1 ? Int(motorRPM.rounded()) : 0
 
@@ -774,17 +772,19 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.speedKmh = (kmh * 10.0).rounded() / 10.0
             }
 
+            // Controller temp: IQ16, int=u16(6), frac=u16(7).
             let controllerT = fixedIntFrac(6, 7)
             if controllerT >= 5 && controllerT <= 120 {
                 telemetry.controllerTemp = floor(controllerT)
             }
 
+            // Motor temp: IQ16, int=u16(8), frac=u16(9).
             let motorT = fixedIntFrac(8, 9)
             if motorT >= 5 && motorT <= 120 {
                 telemetry.motorTemp = floor(motorT)
             }
 
-            // Current: IQ16 at indices 10/11. Use abs — can be negative during regen.
+            // Current: IQ16, int=u16(10), frac=u16(11). abs — can be negative during regen.
             let rawCurrent = abs(fixedIntFrac(10, 11))
             if rawCurrent >= 0 && rawCurrent <= 500 {
                 telemetry.currentA = (rawCurrent * 10.0).rounded() / 10.0
