@@ -634,7 +634,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         let isModbusRead = data.count >= 3 && data[0] == 0x01 && data[1] == 0x03
 
-        // 0x0400 live frame check — identified by shape (voltage + temp ranges).
+        // 0x0400 live frame: must be exactly 53 bytes (byteCount=0x30) AND pass shape check.
         if isDunenLive0400Frame(data) {
             lastLiveNotifyAt = Date()
             inFlightReadStart = nil
@@ -650,8 +650,17 @@ final class DunenBLEManager: NSObject, ObservableObject {
         }
 
         // Route the response to whoever sent the request.
-        // Priority: live (inFlightReadStart) → output block (outInFlightStart) → probe (probeInFlightStart)
+        // For the live 0x0400 slot: only accept if byteCount==0x30 (48 bytes = 24 u16 regs).
+        // Reject short/wrong-size responses so firmware strings don't get decoded as telemetry.
         if let start = inFlightReadStart {
+            let b2 = [UInt8](data)
+            let bc = b2.count >= 3 ? Int(b2[2]) : 0
+            // 0x0400 expects byteCount=0x30; other starts accept any valid size
+            if start == 0x0400 && bc != 0x30 {
+                appLogger.log("PARSER", "live-resp rejected wrong byteCount=\(bc) for 0x400 — not a live frame")
+                // don't clear inFlightReadStart — wait for the real frame
+                return
+            }
             inFlightReadStart = nil
             inFlightSentAt = nil
             appLogger.log("PARSER", "live-resp start=0x\(String(start, radix: 16)) len=\(data.count)")
@@ -763,17 +772,19 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.motorTemp = floor(motorT)
             }
 
-            // Current: IQ16 at indices 10/11
-            let rawCurrent = fixedIntFrac(10, 11)
+            // Current: IQ16 at indices 10/11. Use abs — can be negative during regen.
+            let rawCurrent = abs(fixedIntFrac(10, 11))
             if rawCurrent >= 0 && rawCurrent <= 500 {
                 telemetry.currentA = (rawCurrent * 10.0).rounded() / 10.0
             }
 
-            // 5V rail: IQ16 at indices 12/13; 15V rail: IQ16 at indices 14/15
-            let raw5v = fixedIntFrac(12, 13)
-            if raw5v > 0.5 && raw5v < 7.0 { telemetry.internal5V = (raw5v * 100.0).rounded() / 100.0 }
-            let raw15v = fixedIntFrac(14, 15)
-            if raw15v > 0.5 && raw15v < 20.0 { telemetry.internal15V = (raw15v * 100.0).rounded() / 100.0 }
+            // 5V / 15V rails: not confirmed in this frame yet.
+            // Will be mapped once probe tool confirms their positions.
+            // For now read u16[14]/[15] as a candidate 3.3V/5V rail.
+            let railCandidate = fixedIntFrac(14, 15)
+            if railCandidate > 2.5 && railCandidate < 7.0 {
+                telemetry.internal5V = (railCandidate * 100.0).rounded() / 100.0
+            }
 
             let rawMotor = abs(s16(18))
             lastRawMotorCount = rawMotor
