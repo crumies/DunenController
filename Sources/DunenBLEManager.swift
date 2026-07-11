@@ -734,7 +734,10 @@ final class DunenBLEManager: NSObject, ObservableObject {
             regs.append(u16(i))
         }
 
-        appLogger.log("DUNEN-PAGE", "matchedStart=0x\(String(expectedStart, radix: 16)) regs=" + regs.enumerated().map { "\(expectedStart + $0.offset)=\($0.element)" }.joined(separator: ","))
+        // Only log non-live frames to avoid flooding the log at 0.35s intervals.
+        if expectedStart != 0x0400 {
+            appLogger.log("DUNEN-PAGE", "matchedStart=0x\(String(expectedStart, radix: 16)) regs=" + regs.enumerated().map { "\(expectedStart + $0.offset)=\($0.element)" }.joined(separator: ","))
+        }
 
         switch expectedStart {
         case 0x0400:
@@ -743,7 +746,10 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 appLogger.log("PARSER", "0x0400 frame too short byteCount=\(byteCount) — skipped")
                 return false
             }
-            let liveFlags = u16(2)
+            // Frame layout: 12 × 32-bit IQ16 params, each = u16(even)=frac, u16(odd)=int.
+            // Param 0 = u16(0)/u16(1): status word. Per PDF appendix, live flags are in
+            // the low word of param 0 = u16(1).
+            let liveFlags = u16(1)
             lastLiveFlags = liveFlags
 
             // Voltage: IQ16 at u16 indices 2 (frac) and 3 (int)
@@ -754,25 +760,14 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.bmsSoc = telemetry.batteryPercent
             }
 
-            // Motor RPM: IQ16 pair at u16 indices 4/5.
-            // Log both word orderings so the correct one can be confirmed from the app log.
-            let rpmA = fixedIntFrac(4, 5)   // frac=u16(4), int=u16(5) — matches voltage layout
-            let rpmB = fixedIntFrac(5, 4)   // frac=u16(5), int=u16(4) — opposite order
-            // Pick whichever gives a value in the sane motor RPM range 0–9000.
-            // If both are out of range the motor is stopped.
-            let motorRPM: Double
-            if rpmA >= 0 && rpmA <= 9000 {
-                motorRPM = rpmA
-            } else if rpmB >= 0 && rpmB <= 9000 {
-                motorRPM = rpmB
-            } else {
-                motorRPM = 0
-            }
-            appLogger.log("RPM-RAW", "u16[4]=\(u16(4)) u16[5]=\(u16(5)) rpmA=\(String(format:"%.1f",rpmA)) rpmB=\(String(format:"%.1f",rpmB)) chosen=\(String(format:"%.1f",motorRPM))")
-            telemetry.rpm = motorRPM > 5 ? Int(motorRPM.rounded()) : 0
+            // Motor RPM: IQ16 at u16 indices 4 (frac) and 5 (int).
+            // Same layout as voltage (frac=even, int=odd), confirmed by PDF + log examples.
+            // Controller sends motor shaft RPM; convert to km/h via chain gearing.
+            let motorRPM = abs(fixedIntFrac(4, 5))
+            telemetry.rpm = motorRPM >= 1 ? Int(motorRPM.rounded()) : 0
 
-            // Speed is derived from RPM using gearing.
-            if telemetry.rpm <= 0 {
+            // Speed derived from RPM using gearing.
+            if telemetry.rpm == 0 {
                 telemetry.speedKmh = 0
             } else {
                 let kmh = motorRPM * kmhPerMotorRPM
