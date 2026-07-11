@@ -422,9 +422,9 @@ final class DunenBLEManager: NSObject, ObservableObject {
         }
     }
 
-    // Output register blocks: table-2 addresses (0x03E8 base).
-    // Only probe via the probe tool — do not auto-poll these since controller may not respond.
-    private let outputPollStarts: [Int] = []
+    // Output register blocks polled on the slow 0.9s timer.
+    // Only reg 338 is enabled — contains OVkey (343), OVMon5V (344), OVMon15V (345).
+    private let outputPollStarts: [Int] = [338]
     private var outputPollIdx = 0
 
     /// Fast 0x0400 live frame poll — only handles the live dashboard frame.
@@ -860,9 +860,22 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.errorCode = u16(1)
             }
 
+        case 338:
+            // Reg 338–361: output monitor block.
+            // OVkey=343 (battery voltage backup), OVMon5V=344, OVMon15V=345.
+            // Each param is 32-bit big-endian: high_u16 = integer, low_u16 = fraction.
+            // Reg offset within block = reg - 338. Each reg is one u16 word.
+            // OVMon5V at reg 344 = word index 6, OVMon15V at reg 345 = word index 7.
+            // These are plain scaled integers (not IQ16): raw / 10000.0.
+            if regs.count > 7 {
+                let raw5V  = Double(regs[6])
+                let raw15V = Double(regs[7])
+                if raw5V > 0  { telemetry.internal5V  = raw5V  / 10000.0 }
+                if raw15V > 0 { telemetry.internal15V = raw15V / 10000.0 }
+                appLogger.log("OUT-338", "OVMon5V=\(raw5V) → \(String(format:"%.2f",telemetry.internal5V))V  OVMon15V=\(raw15V) → \(String(format:"%.2f",telemetry.internal15V))V")
+            }
+
         default:
-            // Legacy blocks are ignored in Build104. They are engineering/config tables,
-            // not the page the DUNEN dashboard uses for visible live values.
             break
         }
 
