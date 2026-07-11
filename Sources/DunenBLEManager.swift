@@ -678,10 +678,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
             if voltage >= 45 && voltage <= 95 {
                 // Keep decimals. Do not round.
                 telemetry.voltage = (voltage * 100.0).rounded() / 100.0
-                // voltage-to-SOC for 20s 72V (nominal 84V full, ~60V empty):
-                // full = 84V = 100%, empty = 60V = 0%
-                let soc = ((telemetry.voltage - 60.0) / (84.0 - 60.0)) * 100.0
-                telemetry.batteryPercent = min(100, max(0, soc.rounded()))
+                telemetry.batteryPercent = liIonSoc20s(telemetry.voltage)
                 telemetry.bmsSoc = telemetry.batteryPercent
             }
 
@@ -745,11 +742,8 @@ final class DunenBLEManager: NSObject, ObservableObject {
             let keyVoltage = Double(regs[safe: 5] ?? 0) / 100.0
             if keyVoltage >= 45 && keyVoltage <= 95 {
                 telemetry.voltage = (keyVoltage * 100.0).rounded() / 100.0
-                let soc = ((telemetry.voltage - 60.0) / (84.0 - 60.0)) * 100.0
-                telemetry.batteryPercent = min(100, max(0, soc.rounded()))
+                telemetry.batteryPercent = liIonSoc20s(telemetry.voltage)
                 telemetry.bmsSoc = telemetry.batteryPercent
-            } else if telemetry.voltage == 0 {
-                // voltage not yet set from live frame; keep whatever we have
             }
             let mon5v = Double(regs[safe: 6] ?? 0) / 100.0
             if mon5v > 0 { telemetry.internal5V = mon5v }
@@ -1073,4 +1067,36 @@ private extension Array {
     subscript(safe index: Int) -> Element? {
         indices.contains(index) ? self[index] : nil
     }
+}
+
+/// Piecewise linear voltage→SOC for a 20s LG Li-ion pack (nominal 72V).
+/// Breakpoints calibrated to real LG cell discharge curve; 74V = ~49%.
+/// Full = 84V (4.2V×20) = 100%, empty = 60V (3.0V×20) = 0%.
+private func liIonSoc20s(_ voltage: Double) -> Double {
+    // (voltage, soc%) breakpoints — real Li-ion curve is flat in the middle.
+    let curve: [(v: Double, soc: Double)] = [
+        (84.0, 100.0),
+        (82.0,  93.0),
+        (80.5,  85.0),
+        (79.0,  75.0),
+        (77.5,  65.0),
+        (76.0,  57.0),
+        (74.0,  49.0),  // ← calibrated to your bike BMS reading
+        (72.5,  40.0),
+        (71.0,  30.0),
+        (69.5,  20.0),
+        (68.0,  12.0),
+        (66.0,   5.0),
+        (60.0,   0.0),
+    ]
+    if voltage >= curve[0].v { return 100.0 }
+    if voltage <= curve[curve.count - 1].v { return 0.0 }
+    for i in 0..<(curve.count - 1) {
+        let hi = curve[i], lo = curve[i + 1]
+        if voltage <= hi.v && voltage >= lo.v {
+            let t = (voltage - lo.v) / (hi.v - lo.v)
+            return (lo.soc + t * (hi.soc - lo.soc)).rounded()
+        }
+    }
+    return 0.0
 }
