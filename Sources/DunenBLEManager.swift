@@ -685,7 +685,8 @@ final class DunenBLEManager: NSObject, ObservableObject {
             var lines: [String] = ["Reg\t16-bit words\t32-bit value"]
             var offset = 3
             var regAddr = start
-            while offset + 3 < b.count - 2 && offset + 3 < 3 + byteCount {
+            let probeEnd = min(b.count - 2, 3 + byteCount)
+            while offset + 3 < probeEnd {
                 let hi = Int(b[offset]) << 8 | Int(b[offset+1])
                 let lo = Int(b[offset+2]) << 8 | Int(b[offset+3])
                 let raw32 = Int32(bitPattern: (UInt32(hi) << 16) | UInt32(lo))
@@ -736,10 +737,11 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         switch expectedStart {
         case 0x0400:
-            // REAL live dashboard notification.
-            //
-            // reg1026 is live flags:
-            // ECO=2, XC=10, SPORT=18, brake adds 64, park=0x01, reverse=0x04.
+            // Only decode full live frames — must have at least 24 u16 words (byteCount=0x30).
+            guard byteCount >= 0x30 else {
+                appLogger.log("PARSER", "0x0400 frame too short byteCount=\(byteCount) — skipped")
+                return false
+            }
             let liveFlags = u16(2)
             lastLiveFlags = liveFlags
 
@@ -777,14 +779,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
             if rawCurrent >= 0 && rawCurrent <= 500 {
                 telemetry.currentA = (rawCurrent * 10.0).rounded() / 10.0
             }
-
-            // 5V / 15V rails: not confirmed in this frame yet.
-            // Will be mapped once probe tool confirms their positions.
-            // For now read u16[14]/[15] as a candidate 3.3V/5V rail.
-            let railCandidate = fixedIntFrac(14, 15)
-            if railCandidate > 2.5 && railCandidate < 7.0 {
-                telemetry.internal5V = (railCandidate * 100.0).rounded() / 100.0
-            }
+            // 5V/15V: positions not yet confirmed — omitted until found via probe tool.
 
             let rawMotor = abs(s16(18))
             lastRawMotorCount = rawMotor
