@@ -460,6 +460,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
     /// Slower output register block poll — uses its own in-flight tracker, never touches inFlightReadStart.
     private func requestOutputBlock() {
         guard isConnected, let p = connectedPeripheral else { return }
+        guard !outputPollStarts.isEmpty else { return }
 
         if let start = outInFlightStart {
             let age = Date().timeIntervalSince(outInFlightSentAt ?? Date())
@@ -753,11 +754,25 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.bmsSoc = telemetry.batteryPercent
             }
 
-            // Speed field is motor RPM (IQ16 at u16 indices 4/5).
-            // Convert to km/h using gearing: circumference × 60 / 1000 / driveRatio.
-            let motorRPM = fixedIntFrac(4, 5)
+            // Motor RPM: IQ16 pair at u16 indices 4/5.
+            // Log both word orderings so the correct one can be confirmed from the app log.
+            let rpmA = fixedIntFrac(4, 5)   // frac=u16(4), int=u16(5) — matches voltage layout
+            let rpmB = fixedIntFrac(5, 4)   // frac=u16(5), int=u16(4) — opposite order
+            // Pick whichever gives a value in the sane motor RPM range 0–9000.
+            // If both are out of range the motor is stopped.
+            let motorRPM: Double
+            if rpmA >= 0 && rpmA <= 9000 {
+                motorRPM = rpmA
+            } else if rpmB >= 0 && rpmB <= 9000 {
+                motorRPM = rpmB
+            } else {
+                motorRPM = 0
+            }
+            appLogger.log("RPM-RAW", "u16[4]=\(u16(4)) u16[5]=\(u16(5)) rpmA=\(String(format:"%.1f",rpmA)) rpmB=\(String(format:"%.1f",rpmB)) chosen=\(String(format:"%.1f",motorRPM))")
             telemetry.rpm = motorRPM > 5 ? Int(motorRPM.rounded()) : 0
-            if motorRPM <= 5 {
+
+            // Speed is derived from RPM using gearing.
+            if telemetry.rpm <= 0 {
                 telemetry.speedKmh = 0
             } else {
                 let kmh = motorRPM * kmhPerMotorRPM
@@ -884,8 +899,8 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         telemetry.voltageSag = max(0, lastVoltage - telemetry.voltage)
 
-        if telemetry.speedKmh <= 0.3 {
-            telemetry.rpm = 0
+        if telemetry.rpm <= 5 {
+            telemetry.speedKmh = 0
             telemetry.wheelRPM = 0
             telemetry.throttleOpen = 0
         }

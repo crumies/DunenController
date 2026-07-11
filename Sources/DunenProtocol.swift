@@ -130,9 +130,12 @@ enum DunenProtocol {
         case 282:
             // IADin9: analog current sample, raw / 100.0
             return v / 100.0
-        case 335, 336, 343, 344, 345:
-            // OVkey (343), OVMon5V (344), OVMon15V (345): raw / 100.0
+        case 335, 336, 343:
+            // OVkey (343): battery voltage raw / 100.0
             return v / 100.0
+        case 344, 345:
+            // OVMon5V (344), OVMon15V (345): raw / 10000.0 (e.g. 51700 -> 5.17 V)
+            return v / 10000.0
         case 362:
             // OVechSpd: vehicle speed in km/h, raw / 100.0
             return v / 100.0
