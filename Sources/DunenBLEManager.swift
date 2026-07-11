@@ -413,9 +413,9 @@ final class DunenBLEManager: NSObject, ObservableObject {
         }
     }
 
-    // Output register blocks polled in round-robin every N live ticks.
-    // 266=current, 314=torque, 338=voltage/5V/15V, 362=vehicle speed.
-    private let outputPollStarts = [266, 314, 338, 362]
+    // Output register blocks polled in round-robin every 2 live ticks.
+    // 362 first (speed) so it gets freshest data; others follow.
+    private let outputPollStarts = [362, 338, 362, 266, 362, 314]
     private var outputPollIdx = 0
 
     private func requestLiveOutput() {
@@ -440,8 +440,9 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         let target = notifyCharacteristic ?? secondaryWriteCharacteristic ?? writeCharacteristic
 
-        // Every 4 ticks poll one output register block in round-robin (voltage, speed, current, torque).
-        if liveProbeTick % 4 == 0 {
+        // Every 2 ticks poll one output register block in round-robin (speed, voltage, current, torque).
+        // Speed (362) appears first in the list so it gets polled most frequently.
+        if liveProbeTick % 2 == 0 {
             let start = outputPollStarts[outputPollIdx % outputPollStarts.count]
             outputPollIdx += 1
             let frame = DunenProtocol.modbusReadFrame(start: start, count: 24)
@@ -698,6 +699,18 @@ final class DunenBLEManager: NSObject, ObservableObject {
             telemetry.motorAngle = rawMotor
             telemetry.zeroAngle = u16(20)
 
+            // RPM fallback: if speed poll hasn't arrived yet or speed is 0,
+            // use raw motor count scaled to RPM range as a live indicator.
+            // rawMotor is an electrical angle counter — scale so ~30000 counts ≈ 8000 RPM.
+            if telemetry.speedKmh <= 0.3 {
+                telemetry.rpm = 0
+                telemetry.wheelRPM = 0
+            } else if telemetry.rpm == 0 {
+                // Speed is known but RPM hasn't been set yet from reg 362 — estimate from speed.
+                telemetry.rpm = Int(round(telemetry.speedKmh * motorRPMPerKmh))
+                telemetry.wheelRPM = Double(telemetry.rpm) / finalDriveRatio
+            }
+
             // Throttle/brake state from flags.
             telemetry.brakeActive = (liveFlags & 0x40) != 0
 
@@ -741,39 +754,39 @@ final class DunenBLEManager: NSObject, ObservableObject {
             telemetry.throttleOpen = telemetry.speedKmh <= 0.3 ? 0 : min(1.0, telemetry.speedKmh / 60.0)
 
         case 338:
-            // Block 338–361: OVkey (343), OVMon5V (344), OVMon15V (345)
-            // Reg 343 = index 5, 344 = index 6, 345 = index 7 within this block.
-            let keyVoltage = Double(regs[safe: 5] ?? 0) / 100.0
+            // Block 338–361: DUNEN output table uses 32-bit values, each reg = 2 u16 words.
+            // OVkey (343)   = reg index 5  → u16 pair indices (10, 11)
+            // OVMon5V (344) = reg index 6  → u16 pair indices (12, 13)
+            // OVMon15V(345) = reg index 7  → u16 pair indices (14, 15)
+            // reg index N → u16 hi word = N*2, lo word = N*2+1
+            let keyVoltage = reg32s(regs, idx: 5) / 100.0
             if keyVoltage >= 45 && keyVoltage <= 95 {
                 telemetry.voltage = (keyVoltage * 100.0).rounded() / 100.0
                 telemetry.batteryPercent = liIonSoc20s(telemetry.voltage)
                 telemetry.bmsSoc = telemetry.batteryPercent
             }
-            // OVMon5V / OVMon15V: raw value is in mV*10 units, divide by 10000 to get volts.
-            // e.g. raw 51700 → 5.17V, raw 150000 → 15.0V
-            let mon5v = Double(regs[safe: 6] ?? 0) / 10000.0
+            let mon5v = reg32s(regs, idx: 6) / 100.0
             if mon5v > 0.5 && mon5v < 7.0 { telemetry.internal5V = mon5v }
-            let mon15v = Double(regs[safe: 7] ?? 0) / 10000.0
+            let mon15v = reg32s(regs, idx: 7) / 100.0
             if mon15v > 0.5 && mon15v < 20.0 { telemetry.internal15V = mon15v }
 
         case 266:
-            // Block 266–289: IADin9 (282) = current, index = 282 - 266 = 16
-            let currentRaw = Double(Int16(bitPattern: UInt16(regs[safe: 16] ?? 0))) / 100.0
-            if currentRaw >= 0 { telemetry.currentA = currentRaw }
+            // Block 266–289: IADin9 (282) = reg index 16 → u16 pair (32, 33)
+            let currentVal = reg32s(regs, idx: 16) / 100.0
+            if currentVal >= 0 && currentVal < 500 { telemetry.currentA = currentVal }
 
         case 314:
-            // Block 314–337: OTorq (321), index = 321 - 314 = 7
-            // Scale: example 1.8020 => raw = 18020, stored as single u16 * 10000
-            let torqRaw = regs[safe: 7] ?? 0
-            let torq = Double(torqRaw) / 10000.0
-            if torq >= 0 && torq < 500 { telemetry.torque = torq }
+            // Block 314–337: OTorq (321) = reg index 7 → u16 pair (14, 15)
+            // Scale: example 1.8020 → raw = 18020
+            let torqVal = reg32s(regs, idx: 7) / 10000.0
+            if torqVal >= 0 && torqVal < 500 { telemetry.torque = torqVal }
 
         case 362:
-            // Block 362–385: OVechSpd (362) = vehicle speed, index 0
+            // Block 362–385: OVechSpd (362) = reg index 0 → u16 pair (0, 1)
             // raw / 100.0 = km/h
-            let vechSpd = Double(regs[safe: 0] ?? 0) / 100.0
-            if vechSpd >= 0 && vechSpd <= 200 {
-                telemetry.speedKmh = vechSpd < 0.3 ? 0 : (vechSpd * 10.0).rounded() / 10.0
+            let rawSpd = reg32s(regs, idx: 0) / 100.0
+            if rawSpd >= 0 && rawSpd <= 200 {
+                telemetry.speedKmh = rawSpd < 0.3 ? 0 : (rawSpd * 10.0).rounded() / 10.0
                 if telemetry.speedKmh <= 0.3 {
                     telemetry.rpm = 0
                     telemetry.wheelRPM = 0
@@ -1073,6 +1086,17 @@ private extension Array {
     subscript(safe index: Int) -> Element? {
         indices.contains(index) ? self[index] : nil
     }
+}
+
+/// Read a DUNEN 32-bit signed register from a [Int] array of u16 words.
+/// DUNEN output tables store each logical register as 2 consecutive u16 words: hi word first.
+/// `idx` is the logical register index (0-based from block start).
+/// Returns the signed 32-bit integer value as Double.
+private func reg32s(_ regs: [Int], idx: Int) -> Double {
+    let hi = regs[safe: idx * 2] ?? 0
+    let lo = regs[safe: idx * 2 + 1] ?? 0
+    let raw = Int32(bitPattern: (UInt32(hi) << 16) | UInt32(lo))
+    return Double(raw)
 }
 
 /// Piecewise linear voltage→SOC for a 20s LG Li-ion pack (nominal 72V).
