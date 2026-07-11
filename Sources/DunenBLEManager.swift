@@ -347,9 +347,8 @@ final class DunenBLEManager: NSObject, ObservableObject {
             return Int(UInt16(b[o]) << 8 | UInt16(b[o + 1]))
         }
 
-        // int=even index, frac=odd index (PDF confirmed: high word = integer)
-        func fixed(_ int: Int, _ frac: Int) -> Double {
-            Double(Int16(bitPattern: UInt16(u16(int)))) + Double(u16(frac)) / 65536.0
+        func fixed(_ frac: Int, _ whole: Int) -> Double {
+            Double(Int16(bitPattern: UInt16(u16(whole)))) + Double(u16(frac)) / 65536.0
         }
 
         let voltage = fixed(2, 3)
@@ -424,7 +423,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
     }
 
     // Output register blocks polled on the slow 0.9s timer.
-    // Only reg 338 is enabled — contains OVkey (343), OVMon5V (344), OVMon15V (345).
+    // Reg 338 contains OVMon5V (344) and OVMon15V (345).
     private let outputPollStarts: [Int] = [338]
     private var outputPollIdx = 0
 
@@ -461,7 +460,6 @@ final class DunenBLEManager: NSObject, ObservableObject {
     /// Slower output register block poll — uses its own in-flight tracker, never touches inFlightReadStart.
     private func requestOutputBlock() {
         guard isConnected, let p = connectedPeripheral else { return }
-        guard !outputPollStarts.isEmpty else { return }
 
         if let start = outInFlightStart {
             let age = Date().timeIntervalSince(outInFlightSentAt ?? Date())
@@ -474,6 +472,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
             outInFlightSentAt = nil
         }
 
+        guard !outputPollStarts.isEmpty else { return }
         let start = outputPollStarts[outputPollIdx % outputPollStarts.count]
         outputPollIdx += 1
         let frame = DunenProtocol.modbusReadFrame(start: start, count: 24)
@@ -636,14 +635,9 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         let isModbusRead = data.count >= 3 && data[0] == 0x01 && data[1] == 0x03
 
-        guard isModbusRead else {
-            decodeGenericFrame(data)
-            return
-        }
-
-        // Output block responses must be routed FIRST — before the live-frame shape check —
-        // because reg 338 response is also 0x30 bytes and would be misidentified as 0x0400.
-        if let start = outInFlightStart {
+        // Output block response must be checked FIRST — reg 338 is also 0x30 bytes and
+        // would be misidentified as a live 0x0400 frame by the shape check below.
+        if isModbusRead, let start = outInFlightStart {
             outInFlightStart = nil
             outInFlightSentAt = nil
             appLogger.log("PARSER", "output-block resp start=\(start) len=\(data.count)")
@@ -661,7 +655,14 @@ final class DunenBLEManager: NSObject, ObservableObject {
             return
         }
 
-        // Route the live 0x0400 in-flight request.
+        guard isModbusRead else {
+            decodeGenericFrame(data)
+            return
+        }
+
+        // Route the response to whoever sent the request.
+        // For the live 0x0400 slot: only accept if byteCount==0x30 (48 bytes = 24 u16 regs).
+        // Reject short/wrong-size responses so firmware strings don't get decoded as telemetry.
         if let start = inFlightReadStart {
             let b2 = [UInt8](data)
             let bc = b2.count >= 3 ? Int(b2[2]) : 0
@@ -722,11 +723,11 @@ final class DunenBLEManager: NSObject, ObservableObject {
             Int(Int16(bitPattern: UInt16(u16(index))))
         }
 
-        func fixedIntFrac(_ intIndex: Int, _ fracIndex: Int) -> Double {
-            // PDF example 1.3.1: 0x05DC0000 / 65536 = 1500 — integer is in HIGH word.
-            // Frame byte order: high word first (big-endian 32-bit).
-            // So for a pair at positions n, n+1: u16(n)=high=integer, u16(n+1)=low=fraction.
-            // reg1026=66, reg1027=80 => voltage = 66 + 80/65536 = ~66V (72V pack, makes sense).
+        func fixedIntFrac(_ fracIndex: Int, _ intIndex: Int) -> Double {
+            // DUNEN live 0x0400 uses: low word = fractional / 65536, next word = integer.
+            // Example from real DUNEN log:
+            // reg1026=66 reg1027=80 => ~80.001V
+            // reg1030=41759 reg1031=30 => ~30.637C
             Double(s16(intIndex)) + (Double(u16(fracIndex)) / 65536.0)
         }
 
@@ -735,10 +736,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
             regs.append(u16(i))
         }
 
-        // Only log non-live frames to avoid flooding the log at 0.35s intervals.
-        if expectedStart != 0x0400 {
-            appLogger.log("DUNEN-PAGE", "matchedStart=0x\(String(expectedStart, radix: 16)) regs=" + regs.enumerated().map { "\(expectedStart + $0.offset)=\($0.element)" }.joined(separator: ","))
-        }
+        appLogger.log("DUNEN-PAGE", "matchedStart=0x\(String(expectedStart, radix: 16)) regs=" + regs.enumerated().map { "\(expectedStart + $0.offset)=\($0.element)" }.joined(separator: ","))
 
         switch expectedStart {
         case 0x0400:
@@ -747,12 +745,10 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 appLogger.log("PARSER", "0x0400 frame too short byteCount=\(byteCount) — skipped")
                 return false
             }
-            // Live flags come from u16(2) — confirmed working in earlier builds.
             let liveFlags = u16(2)
             lastLiveFlags = liveFlags
 
-            // Voltage: IQ16, int=u16(2), frac=u16(3). PDF: high word = integer.
-            // reg1026=66(int), reg1027=80(frac) => 66 + 80/65536 = ~66V on a 72V pack. ✓
+            // Voltage: IQ16 at u16 indices 2 (frac) and 3 (int)
             let voltage = fixedIntFrac(2, 3)
             if voltage >= 45 && voltage <= 95 {
                 telemetry.voltage = (voltage * 100.0).rounded() / 100.0
@@ -760,31 +756,28 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.bmsSoc = telemetry.batteryPercent
             }
 
-            // Motor RPM: IQ16, int=u16(4), frac=u16(5).
+            // Speed field is motor RPM (IQ16 at u16 indices 4/5).
+            // Convert to km/h using gearing: circumference × 60 / 1000 / driveRatio.
             let motorRPM = abs(fixedIntFrac(4, 5))
             telemetry.rpm = motorRPM >= 1 ? Int(motorRPM.rounded()) : 0
-
-            // Speed derived from RPM using gearing.
-            if telemetry.rpm == 0 {
+            if motorRPM <= 5 {
                 telemetry.speedKmh = 0
             } else {
                 let kmh = motorRPM * kmhPerMotorRPM
                 telemetry.speedKmh = (kmh * 10.0).rounded() / 10.0
             }
 
-            // Controller temp: IQ16, int=u16(6), frac=u16(7).
             let controllerT = fixedIntFrac(6, 7)
             if controllerT >= 5 && controllerT <= 120 {
                 telemetry.controllerTemp = floor(controllerT)
             }
 
-            // Motor temp: IQ16, int=u16(8), frac=u16(9).
             let motorT = fixedIntFrac(8, 9)
             if motorT >= 5 && motorT <= 120 {
                 telemetry.motorTemp = floor(motorT)
             }
 
-            // Current: IQ16, int=u16(10), frac=u16(11). abs — can be negative during regen.
+            // Current: IQ16 at indices 10/11. Use abs — can be negative during regen.
             let rawCurrent = abs(fixedIntFrac(10, 11))
             if rawCurrent >= 0 && rawCurrent <= 500 {
                 telemetry.currentA = (rawCurrent * 10.0).rounded() / 10.0
@@ -861,18 +854,13 @@ final class DunenBLEManager: NSObject, ObservableObject {
             }
 
         case 338:
-            // Reg 338–361: output monitor block.
-            // OVkey=343 (battery voltage backup), OVMon5V=344, OVMon15V=345.
-            // Each param is 32-bit big-endian: high_u16 = integer, low_u16 = fraction.
-            // Reg offset within block = reg - 338. Each reg is one u16 word.
             // OVMon5V at reg 344 = word index 6, OVMon15V at reg 345 = word index 7.
-            // These are plain scaled integers (not IQ16): raw / 10000.0.
+            // Raw value e.g. 51700 → 51700/10000.0 = 5.17V
             if regs.count > 7 {
                 let raw5V  = Double(regs[6])
                 let raw15V = Double(regs[7])
-                if raw5V > 0  { telemetry.internal5V  = raw5V  / 10000.0 }
+                if raw5V  > 0 { telemetry.internal5V  = raw5V  / 10000.0 }
                 if raw15V > 0 { telemetry.internal15V = raw15V / 10000.0 }
-                appLogger.log("OUT-338", "OVMon5V=\(raw5V) → \(String(format:"%.2f",telemetry.internal5V))V  OVMon15V=\(raw15V) → \(String(format:"%.2f",telemetry.internal15V))V")
             }
 
         default:
@@ -907,8 +895,8 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         telemetry.voltageSag = max(0, lastVoltage - telemetry.voltage)
 
-        if telemetry.rpm <= 5 {
-            telemetry.speedKmh = 0
+        if telemetry.speedKmh <= 0.3 {
+            telemetry.rpm = 0
             telemetry.wheelRPM = 0
             telemetry.throttleOpen = 0
         }
