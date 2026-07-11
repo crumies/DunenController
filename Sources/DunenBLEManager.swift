@@ -422,8 +422,9 @@ final class DunenBLEManager: NSObject, ObservableObject {
         }
     }
 
-    // Output register blocks cycled in order: speed first, then voltage/rails, current, torque.
-    private let outputPollStarts = [362, 338, 266, 314]
+    // Output register blocks: table-2 addresses (0x03E8 base).
+    // Only probe via the probe tool — do not auto-poll these since controller may not respond.
+    private let outputPollStarts: [Int] = []
     private var outputPollIdx = 0
 
     /// Fast 0x0400 live frame poll — only handles the live dashboard frame.
@@ -733,12 +734,18 @@ final class DunenBLEManager: NSObject, ObservableObject {
             let liveFlags = u16(2)
             lastLiveFlags = liveFlags
 
+            // Voltage: IQ16 at u16 indices 2 (frac) and 3 (int)
             let voltage = fixedIntFrac(2, 3)
             if voltage >= 45 && voltage <= 95 {
-                // Keep decimals. Do not round.
                 telemetry.voltage = (voltage * 100.0).rounded() / 100.0
                 telemetry.batteryPercent = liIonSoc20s(telemetry.voltage)
                 telemetry.bmsSoc = telemetry.batteryPercent
+            }
+
+            // Speed: IQ16 at u16 indices 4 (frac) and 5 (int)
+            let rawSpeed = fixedIntFrac(4, 5)
+            if rawSpeed >= 0 && rawSpeed <= 200 {
+                telemetry.speedKmh = rawSpeed < 0.5 ? 0 : (rawSpeed * 10.0).rounded() / 10.0
             }
 
             let controllerT = fixedIntFrac(6, 7)
@@ -751,19 +758,28 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.motorTemp = floor(motorT)
             }
 
+            // Current: IQ16 at indices 10/11
+            let rawCurrent = fixedIntFrac(10, 11)
+            if rawCurrent >= 0 && rawCurrent <= 500 {
+                telemetry.currentA = (rawCurrent * 10.0).rounded() / 10.0
+            }
+
+            // 5V rail: IQ16 at indices 12/13; 15V rail: IQ16 at indices 14/15
+            let raw5v = fixedIntFrac(12, 13)
+            if raw5v > 0.5 && raw5v < 7.0 { telemetry.internal5V = (raw5v * 100.0).rounded() / 100.0 }
+            let raw15v = fixedIntFrac(14, 15)
+            if raw15v > 0.5 && raw15v < 20.0 { telemetry.internal15V = (raw15v * 100.0).rounded() / 100.0 }
+
             let rawMotor = abs(s16(18))
             lastRawMotorCount = rawMotor
             telemetry.motorAngle = rawMotor
             telemetry.zeroAngle = u16(20)
 
-            // RPM fallback: if speed poll hasn't arrived yet or speed is 0,
-            // use raw motor count scaled to RPM range as a live indicator.
-            // rawMotor is an electrical angle counter — scale so ~30000 counts ≈ 8000 RPM.
+            // RPM estimated from vehicle speed + gearing
             if telemetry.speedKmh <= 0.3 {
                 telemetry.rpm = 0
                 telemetry.wheelRPM = 0
-            } else if telemetry.rpm == 0 {
-                // Speed is known but RPM hasn't been set yet from reg 362 — estimate from speed.
+            } else {
                 telemetry.rpm = Int(round(telemetry.speedKmh * motorRPMPerKmh))
                 telemetry.wheelRPM = Double(telemetry.rpm) / finalDriveRatio
             }
@@ -804,54 +820,8 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 lastStableRideMode = .eco
             }
 
-            // There is no lean sensor confirmed in this frame.
             telemetry.leanAngle = 0
-            // Speed and RPM are updated from OVechSpd (reg 362) poll — not derived here.
-            // Keep throttle open estimate based on whatever speed is already set.
             telemetry.throttleOpen = telemetry.speedKmh <= 0.3 ? 0 : min(1.0, telemetry.speedKmh / 60.0)
-
-        case 338:
-            // Block 338–361: DUNEN output table uses 32-bit values, each reg = 2 u16 words.
-            // OVkey (343)   = reg index 5  → u16 pair indices (10, 11)
-            // OVMon5V (344) = reg index 6  → u16 pair indices (12, 13)
-            // OVMon15V(345) = reg index 7  → u16 pair indices (14, 15)
-            // reg index N → u16 hi word = N*2, lo word = N*2+1
-            let keyVoltage = reg32s(regs, idx: 5) / 100.0
-            if keyVoltage >= 45 && keyVoltage <= 95 {
-                telemetry.voltage = (keyVoltage * 100.0).rounded() / 100.0
-                telemetry.batteryPercent = liIonSoc20s(telemetry.voltage)
-                telemetry.bmsSoc = telemetry.batteryPercent
-            }
-            let mon5v = reg32s(regs, idx: 6) / 100.0
-            if mon5v > 0.5 && mon5v < 7.0 { telemetry.internal5V = mon5v }
-            let mon15v = reg32s(regs, idx: 7) / 100.0
-            if mon15v > 0.5 && mon15v < 20.0 { telemetry.internal15V = mon15v }
-
-        case 266:
-            // Block 266–289: IADin9 (282) = reg index 16 → u16 pair (32, 33)
-            let currentVal = reg32s(regs, idx: 16) / 100.0
-            if currentVal >= 0 && currentVal < 500 { telemetry.currentA = currentVal }
-
-        case 314:
-            // Block 314–337: OTorq (321) = reg index 7 → u16 pair (14, 15)
-            // Scale: example 1.8020 → raw = 18020
-            let torqVal = reg32s(regs, idx: 7) / 10000.0
-            if torqVal >= 0 && torqVal < 500 { telemetry.torque = torqVal }
-
-        case 362:
-            // Block 362–385: OVechSpd (362) = reg index 0 → u16 pair (0, 1)
-            // raw / 100.0 = km/h
-            let rawSpd = reg32s(regs, idx: 0) / 100.0
-            if rawSpd >= 0 && rawSpd <= 200 {
-                telemetry.speedKmh = rawSpd < 0.3 ? 0 : (rawSpd * 10.0).rounded() / 10.0
-                if telemetry.speedKmh <= 0.3 {
-                    telemetry.rpm = 0
-                    telemetry.wheelRPM = 0
-                } else {
-                    telemetry.rpm = Int(round(telemetry.speedKmh * motorRPMPerKmh))
-                    telemetry.wheelRPM = Double(telemetry.rpm) / finalDriveRatio
-                }
-            }
 
         case 0x0122:
             appLogger.log("MODEMAP", "0x0122 ignored; live flags control mode")

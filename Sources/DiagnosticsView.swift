@@ -167,14 +167,15 @@ struct DiagnosticsView: View {
 struct RegisterProbeCard: View {
     @EnvironmentObject var ble: DunenBLEManager
 
-    // Known useful register blocks with descriptions
+    // Table-2 debug interface starts at 0x03E8 (1000).
+    // Each param = 2 × 16-bit words. count=24 reads 12 params.
     private let knownBlocks: [(label: String, start: Int, count: Int)] = [
-        ("Live dashboard (0x0400, 24 regs)", 0x0400, 24),
-        ("Speed OVechSpd (362, 12 params)", 362, 24),
-        ("Voltage/5V/15V (338, 12 params)",  338, 24),
-        ("Current IADin9 (266, 12 params)",  266, 24),
-        ("Torque OTorq (314, 12 params)",    314, 24),
-        ("Fault/warn (410, 12 params)",       410, 24),
+        ("Live 0x0400 (all 12 params)", 0x0400, 24),
+        ("0x03E8 base (params 0–11)",   0x03E8, 24),
+        ("0x03F4 (params 6–17)",        0x03F4, 24),
+        ("0x0400 (params 12–23)",       0x0400, 24),
+        ("0x040C (params 18–29)",       0x040C, 24),
+        ("0x0418 (params 24–35)",       0x0418, 24),
     ]
 
     @State private var startText = "362"
