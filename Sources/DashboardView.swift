@@ -138,9 +138,9 @@ struct HUDBlock: View {
 
                     if settings.hudShowTemps {
                         HStack {
-                            statusIcon("cpu", String(format: "%.1f°C", ble.telemetry.controllerTemp))
+                            statusIcon("cpu", String(format: "%.0f°C", ble.telemetry.controllerTemp))
                             Spacer()
-                            motorTempIcon(String(format: "%.1f°C", ble.telemetry.motorTemp))
+                            motorTempIcon(String(format: "%.0f°C", ble.telemetry.motorTemp))
                             Spacer()
                             statusIcon("battery.75percent", String(format: "%.0f%%", ble.telemetry.batteryPercent))
                         }

@@ -422,8 +422,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
         }
     }
 
-    // Output register blocks polled on the slow 0.9s timer.
-    // Reg 338 contains OVMon5V (344) and OVMon15V (345).
+    // Reg 338 polled every 0.9s for OVMon5V (344) and OVMon15V (345).
     private let outputPollStarts: [Int] = [338]
     private var outputPollIdx = 0
 
@@ -635,17 +634,6 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         let isModbusRead = data.count >= 3 && data[0] == 0x01 && data[1] == 0x03
 
-        // Output block response: only claim it when byteCount matches the expected 0x30
-        // (24 registers × 2 bytes). This prevents stealing tuning reads or live frames.
-        let byteCount3 = data.count >= 3 ? Int(data[2]) : 0
-        if isModbusRead, byteCount3 == 0x30, let start = outInFlightStart {
-            outInFlightStart = nil
-            outInFlightSentAt = nil
-            appLogger.log("PARSER", "output-block resp start=\(start) len=\(data.count)")
-            _ = decodeDunenPage(data, expectedStart: start)
-            return
-        }
-
         // 0x0400 live frame: must be exactly 53 bytes (byteCount=0x30) AND pass shape check.
         if isDunenLive0400Frame(data) {
             lastLiveNotifyAt = Date()
@@ -678,6 +666,28 @@ final class DunenBLEManager: NSObject, ObservableObject {
             appLogger.log("PARSER", "live-resp start=0x\(String(start, radix: 16)) len=\(data.count)")
             _ = decodeDunenPage(data, expectedStart: start)
             return
+        }
+
+        if let start = outInFlightStart {
+            outInFlightStart = nil
+            outInFlightSentAt = nil
+            appLogger.log("PARSER", "output-block resp start=\(start) len=\(data.count)")
+            _ = decodeDunenPage(data, expectedStart: start)
+            return
+        }
+
+        // Tuning read responses — pendingReadStarts holds expected starts (99, 211).
+        if !pendingReadStarts.isEmpty {
+            let b2 = [UInt8](data)
+            let bc = b2.count >= 3 ? Int(b2[2]) : 0
+            // Each tuning block is 24 u16 = 48 bytes = byteCount 0x30
+            if bc == 0x30, let start = pendingReadStarts.first {
+                pendingReadStarts.removeFirst()
+                appLogger.log("PARSER", "tuning resp start=\(start) len=\(data.count)")
+                let values = DunenProtocol.parseParameterValues(from: data, expectedStart: start)
+                tuningStore?.applyControllerValues(values)
+                return
+            }
         }
 
         if let start = probeInFlightStart {
@@ -746,10 +756,12 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 appLogger.log("PARSER", "0x0400 frame too short byteCount=\(byteCount) — skipped")
                 return false
             }
-            let liveFlags = u16(2)
+            // Live flags are in u16(0) — the first word of the frame.
+            // u16(2) is the voltage fraction word (e.g. 66) — NOT flags.
+            let liveFlags = u16(0)
             lastLiveFlags = liveFlags
 
-            // Voltage: IQ16 at u16 indices 2 (frac) and 3 (int)
+            // Voltage: IQ16 frac=u16(2), int=u16(3). Confirmed: reg1026=66,reg1027=74 → 74.001V
             let voltage = fixedIntFrac(2, 3)
             if voltage >= 45 && voltage <= 95 {
                 telemetry.voltage = (voltage * 100.0).rounded() / 100.0
@@ -757,33 +769,31 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.bmsSoc = telemetry.batteryPercent
             }
 
-            // Speed field is motor RPM (IQ16 at u16 indices 4/5).
-            // Convert to km/h using gearing: circumference × 60 / 1000 / driveRatio.
-            let motorRPM = abs(fixedIntFrac(4, 5))
-            telemetry.rpm = motorRPM >= 1 ? Int(motorRPM.rounded()) : 0
-            if motorRPM <= 5 {
-                telemetry.speedKmh = 0
-            } else {
-                let kmh = motorRPM * kmhPerMotorRPM
-                telemetry.speedKmh = (kmh * 10.0).rounded() / 10.0
+            // Indices 4/5: confirmed throttle %, NOT RPM. Don't use as RPM.
+            // Store as throttleOpen (0–1). Value like 2.016 at idle = 2% throttle.
+            let throttleVal = fixedIntFrac(4, 5)
+            if throttleVal >= 0 && throttleVal <= 100 {
+                telemetry.throttleOpen = (throttleVal / 100.0 * 10.0).rounded() / 10.0
             }
 
+            // Controller temp: IQ16 frac=u16(6), int=u16(7).
             let controllerT = fixedIntFrac(6, 7)
             if controllerT >= 5 && controllerT <= 120 {
                 telemetry.controllerTemp = (controllerT * 10.0).rounded() / 10.0
             }
 
+            // Motor temp: IQ16 frac=u16(8), int=u16(9).
             let motorT = fixedIntFrac(8, 9)
             if motorT >= 5 && motorT <= 120 {
                 telemetry.motorTemp = (motorT * 10.0).rounded() / 10.0
             }
 
-            // Current: IQ16 at indices 10/11. Use abs — can be negative during regen.
+            // Current: IQ16 frac=u16(10), int=u16(11). abs — negative during regen.
             let rawCurrent = abs(fixedIntFrac(10, 11))
             if rawCurrent >= 0 && rawCurrent <= 500 {
                 telemetry.currentA = (rawCurrent * 10.0).rounded() / 10.0
             }
-            // 5V/15V: positions not yet confirmed — omitted until found via probe tool.
+            // 5V/15V not confirmed in live frame — read from reg 338 output poll.
 
             let rawMotor = abs(s16(18))
             lastRawMotorCount = rawMotor
@@ -797,15 +807,15 @@ final class DunenBLEManager: NSObject, ObservableObject {
             telemetry.brakeActive = (liveFlags & 0x40) != 0
 
             // Park / Reverse from live flags.
-            // Guard reverse: only accept if RPM is low (reverse is slow, < 400 RPM).
-            // Guard park: only accept if speed AND rpm are both near zero.
-            if (liveFlags & 0x04) != 0 && telemetry.rpm < 400 {
+            // Confirmed: 0x04 = reverse. Park bit is not confirmed — detect by
+            // flags == 0 (no drive mode bits set) when speed is already 0.
+            if (liveFlags & 0x04) != 0 {
                 telemetry.mode = .reverse
                 telemetry.reverseActive = true
                 telemetry.parkingActive = false
                 lastStableRideMode = .reverse
-            } else if (liveFlags == 0 || (liveFlags & 0x20) != 0) && telemetry.speedKmh < 1.0 && telemetry.rpm < 50 {
-                // Only park when actually stationary — prevents noise triggering park mode.
+            } else if liveFlags == 0 || (liveFlags & 0x20) != 0 {
+                // flags == 0 or explicit park bit: vehicle is in park
                 telemetry.mode = .park
                 telemetry.parkingActive = true
                 telemetry.reverseActive = false
@@ -855,13 +865,12 @@ final class DunenBLEManager: NSObject, ObservableObject {
             }
 
         case 338:
-            // OVMon5V at reg 344 = word index 6, OVMon15V at reg 345 = word index 7.
-            // Raw value e.g. 51700 → 51700/10000.0 = 5.17V
+            // OVMon5V=reg344=word[6], OVMon15V=reg345=word[7]. Raw/10000 → volts.
             if regs.count > 7 {
-                let raw5V  = Double(regs[6])
-                let raw15V = Double(regs[7])
-                if raw5V  > 0 { telemetry.internal5V  = raw5V  / 10000.0 }
-                if raw15V > 0 { telemetry.internal15V = raw15V / 10000.0 }
+                let v5  = Double(regs[6])
+                let v15 = Double(regs[7])
+                if v5  > 0 { telemetry.internal5V  = v5  / 10000.0 }
+                if v15 > 0 { telemetry.internal15V = v15 / 10000.0 }
             }
 
         default:
@@ -896,16 +905,9 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         telemetry.voltageSag = max(0, lastVoltage - telemetry.voltage)
 
-        if telemetry.speedKmh <= 0.3 {
-            telemetry.rpm = 0
-            telemetry.wheelRPM = 0
-            telemetry.throttleOpen = 0
-        }
-
-        // Do NOT calculate lean from throttle/acceleration. No confirmed lean sensor yet.
+        // Do NOT zero rpm/speed here — they are set by the decoder directly.
         telemetry.gForce = 0
         telemetry.leanAngle = 0
-
         telemetry.theoreticalTopSpeedKmh = 136.0
 
         lastSpeedKmh = telemetry.speedKmh
@@ -1155,7 +1157,7 @@ private func liIonSoc20s(_ voltage: Double) -> Double {
         (79.0,  75.0),
         (77.5,  65.0),
         (76.0,  57.0),
-        (74.0,  49.0),  // ← calibrated to your bike BMS reading
+        (74.0,  48.0),  // ← calibrated: bike BMS reads 48% at 74V
         (72.5,  40.0),
         (71.0,  30.0),
         (69.5,  20.0),
