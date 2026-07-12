@@ -40,7 +40,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
     private var pollFrames: [(start: Int, data: Data)] = []
     private var pollIndex: Int = 0
     private var pendingReadStarts: [Int] = []
-    private var inFlightReadStart: Int?        // for 0x0400 live frame only
+    private var inFlightReadStart: Int?        // for 0x03F2 live frame only
     private var inFlightSentAt: Date?
     private var outInFlightStart: Int?          // for output register block polls
     private var outInFlightSentAt: Date?
@@ -191,12 +191,19 @@ final class DunenBLEManager: NSObject, ObservableObject {
             return
         }
         tuningStore?.markReading()
-        pendingReadStarts.append(99)
-        p.writeValue(DunenProtocol.modbusReadFrame(start: 97, count: 24), for: c, type: c.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse)
+        // Function-code parameter table: address = (row-2)*2.
+        // TuningParameter id=99 (row 99) → address (99-2)*2=194=0xC2.
+        // Read 24 words (= 12 parameters) starting at address 0xC2, covering rows 99–110.
+        let addr99 = (99 - 2) * 2    // 194 = 0xC2
+        pendingReadStarts.append(addr99)
+        p.writeValue(DunenProtocol.modbusReadFrame(start: addr99, count: 24), for: c, type: c.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self, weak p, weak c] in
             guard let self, let p, let c else { return }
-            self.pendingReadStarts.append(211)
-            p.writeValue(DunenProtocol.modbusReadFrame(start: 209, count: 24), for: c, type: c.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse)
+            // TuningParameter id=211 (row 211) → address (211-2)*2=418=0x1A2.
+            // TuningParameter id=212 (row 212) → address (212-2)*2=420=0x1A4 (adjacent, same block).
+            let addr211 = (211 - 2) * 2   // 418 = 0x1A2
+            self.pendingReadStarts.append(addr211)
+            p.writeValue(DunenProtocol.modbusReadFrame(start: addr211, count: 24), for: c, type: c.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse)
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
@@ -266,10 +273,11 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         pollFrames = [
             (0x0418, DunenProtocol.modbusReadFrame(start: 0x0418, count: 0x0002)),
-            (0x0400, DunenProtocol.modbusReadFrame(start: 0x0400, count: 0x0018))
+            // Extend to 0x03F2 (1010) to include ModeState, ActualSpeed (RPM)
+            (0x03F2, DunenProtocol.modbusReadFrame(start: 0x03F2, count: 0x0026))
         ]
 
-        // Fast timer: only 0x0400 live frame
+        // Fast timer: live frame starting at 0x03F2 to include RPM, mode, and all live values
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
             guard let self else { return }
             DispatchQueue.main.async { self.requestLiveOutput() }
@@ -334,12 +342,11 @@ final class DunenBLEManager: NSObject, ObservableObject {
         p.writeValue(data, for: c, type: type)
     }
 
-    private func isDunenLive0400Frame(_ data: Data) -> Bool {
+    private func isDunenLivePrimaryFrame(_ data: Data) -> Bool {
         let b = [UInt8](data)
-        // 0x0400 live frame is exactly 0x30 (48) payload bytes = 53 total.
-        // Output register blocks (266,314,338,362) are also 24 regs = 0x30 bytes —
-        // disambiguate by requiring BOTH temps to be in a realistic range (5–120°C).
-        guard b.count >= 53, b[0] == 0x01, b[1] == 0x03, b[2] == 0x30 else { return false }
+        // Live frame starts at 0x03F2 (40 words = 80 data bytes = byteCount 0x50), total 85 bytes.
+        // Validate by byteCount and require voltage+temps in realistic range.
+        guard b.count >= 85, b[0] == 0x01, b[1] == 0x03, b[2] == 0x50 else { return false }
 
         func u16(_ index: Int) -> Int {
             let o = 3 + index * 2
@@ -351,12 +358,13 @@ final class DunenBLEManager: NSObject, ObservableObject {
             Double(Int16(bitPattern: UInt16(u16(whole)))) + Double(u16(frac)) / 65536.0
         }
 
-        let voltage = fixed(2, 3)
-        let controllerT = fixed(6, 7)
-        let motorT = fixed(8, 9)
+        // Voltage: frac=word16, int=word17 (Udc at address 1026, offset from 0x03F2=1010: (1026-1010)/2=8 pairs → word16,17)
+        let voltage = fixed(16, 17)
+        // Controller temp: frac=word20, int=word21 (MosTmp at 1030, offset=(1030-1010)/2=10 pairs → word20,21)
+        let controllerT = fixed(20, 21)
+        // Motor temp: frac=word22, int=word23 (MotorTmp at 1032 → word22,23)
+        let motorT = fixed(22, 23)
 
-        // Require voltage in range AND both temps realistic to avoid misidentifying
-        // output register poll responses (reg 266/314/338/362) as 0x0400.
         return voltage >= 45 && voltage <= 95 &&
                controllerT >= 5 && controllerT <= 120 &&
                motorT >= 5 && motorT <= 120
@@ -426,7 +434,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
     private let outputPollStarts: [Int] = [338]
     private var outputPollIdx = 0
 
-    /// Fast 0x0400 live frame poll — only handles the live dashboard frame.
+    /// Fast live frame poll (start=0x03F2) — only handles the primary dashboard frame.
     private func requestLiveOutput() {
         guard isConnected, let p = connectedPeripheral else { return }
 
@@ -447,10 +455,17 @@ final class DunenBLEManager: NSObject, ObservableObject {
             inFlightSentAt = nil
         }
 
-        let frame = DunenProtocol.modbusReadFrame(start: 0x0400, count: 0x0018)
-        inFlightReadStart = 0x0400
+        // Start at 0x03F2 (reg 1010) and read 40 words to cover through ErrCode (reg 1048).
+        // Word layout: Idref(0,1) Iqref(2,3) AccPedal(4,5) DebugEnable(6,7)
+        //              EnableState(8,9) ModeState(10,11) ActualSpeed/RPM(12,13)
+        //              ActualTorque(14,15) Udc/voltage(16,17) Imag/current(18,19)
+        //              MosTmp/ctrlTemp(20,21) MotorTmp(22,23) Idfed(24,25) Iqfed(26,27)
+        //              Umag/phaseV(28,29) IdEst/busCur(30,31) Dangle/angle(32,33)
+        //              ZeroAngle(34,35) WarnCode(36,37) ErrCode(38,39)
+        let frame = DunenProtocol.modbusReadFrame(start: 0x03F2, count: 0x0028)
+        inFlightReadStart = 0x03F2
         inFlightSentAt = Date()
-        developerStatus = "Live 0x0400"
+        developerStatus = "Live 0x03F2"
         let target = notifyCharacteristic ?? secondaryWriteCharacteristic ?? writeCharacteristic
         sendReadOnlyFrame(frame, via: target, peripheral: p, note: "live start=0x400")
         liveProbeTick += 1
@@ -634,13 +649,13 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         let isModbusRead = data.count >= 3 && data[0] == 0x01 && data[1] == 0x03
 
-        // 0x0400 live frame: must be exactly 53 bytes (byteCount=0x30) AND pass shape check.
-        if isDunenLive0400Frame(data) {
+        // Primary live frame: starts at 0x03F2 (byteCount=0x4C) — pass shape check.
+        if isDunenLivePrimaryFrame(data) {
             lastLiveNotifyAt = Date()
             inFlightReadStart = nil
             inFlightSentAt = nil
-            appLogger.log("PARSER", "live 0x400 len=\(data.count)")
-            _ = decodeDunenPage(data, expectedStart: 0x0400)
+            appLogger.log("PARSER", "live 0x03F2 len=\(data.count)")
+            _ = decodeDunenPage(data, expectedStart: 0x03F2)
             return
         }
 
@@ -650,14 +665,14 @@ final class DunenBLEManager: NSObject, ObservableObject {
         }
 
         // Route the response to whoever sent the request.
-        // For the live 0x0400 slot: only accept if byteCount==0x30 (48 bytes = 24 u16 regs).
+        // For the live 0x03F2 slot: only accept if byteCount==0x50 (80 bytes = 40 u16 words).
         // Reject short/wrong-size responses so firmware strings don't get decoded as telemetry.
         if let start = inFlightReadStart {
             let b2 = [UInt8](data)
             let bc = b2.count >= 3 ? Int(b2[2]) : 0
-            // 0x0400 expects byteCount=0x30; other starts accept any valid size
-            if start == 0x0400 && bc != 0x30 {
-                appLogger.log("PARSER", "live-resp rejected wrong byteCount=\(bc) for 0x400 — not a live frame")
+            // 0x03F2 frame expects byteCount=0x50 (40 words×2); reject wrong-size responses
+            if start == 0x03F2 && bc != 0x50 {
+                appLogger.log("PARSER", "live-resp rejected wrong byteCount=\(bc) for 0x03F2 — not a live frame")
                 // don't clear inFlightReadStart — wait for the real frame
                 return
             }
@@ -676,7 +691,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
             return
         }
 
-        // Tuning read responses — pendingReadStarts holds expected starts (99, 211).
+        // Tuning read responses — pendingReadStarts holds Modbus addresses (194, 418, etc.)
         if !pendingReadStarts.isEmpty {
             let b2 = [UInt8](data)
             let bc = b2.count >= 3 ? Int(b2[2]) : 0
@@ -693,19 +708,21 @@ final class DunenBLEManager: NSObject, ObservableObject {
         if let start = probeInFlightStart {
             probeInFlightStart = nil
             probeInFlight = false
-            // Build human-readable dump of all 32-bit values in the block
+            // Build human-readable dump of all 32-bit values in the block.
+            // DUNEN IQ16 encoding: HIGH 16-bit word = fraction, LOW 16-bit word = integer.
             let b = [UInt8](data)
             let byteCount = b.count >= 3 ? Int(b[2]) : 0
-            var lines: [String] = ["Reg\t16-bit words\t32-bit value"]
+            var lines: [String] = ["Addr\tHIGH(frac)\tLOW(int)\tIQ16 value\tU32 raw"]
             var offset = 3
             var regAddr = start
             let probeEnd = min(b.count - 2, 3 + byteCount)
             while offset + 3 < probeEnd {
-                let hi = Int(b[offset]) << 8 | Int(b[offset+1])
-                let lo = Int(b[offset+2]) << 8 | Int(b[offset+3])
-                let raw32 = Int32(bitPattern: (UInt32(hi) << 16) | UInt32(lo))
-                let iq16 = Double(raw32) / 65536.0
-                lines.append("\(regAddr)\t\(hi) \(lo)\t\(raw32) (IQ16=\(String(format:"%.4f",iq16)))")
+                let hiWord = Int(b[offset]) << 8 | Int(b[offset+1])      // HIGH 16b = frac
+                let loWord = Int(b[offset+2]) << 8 | Int(b[offset+3])    // LOW 16b = integer
+                let intPart = Double(Int16(bitPattern: UInt16(loWord)))
+                let iq16val = intPart + Double(hiWord) / 65536.0
+                let raw32 = Int32(bitPattern: (UInt32(hiWord) << 16) | UInt32(loWord))
+                lines.append("\(regAddr)\t\(hiWord)\t\(loWord)\t\(String(format:"%.4f",iq16val))\t\(raw32)")
                 regAddr += 2
                 offset += 4
             }
@@ -750,27 +767,48 @@ final class DunenBLEManager: NSObject, ObservableObject {
         appLogger.log("DUNEN-PAGE", "matchedStart=0x\(String(expectedStart, radix: 16)) regs=" + regs.enumerated().map { "\(expectedStart + $0.offset)=\($0.element)" }.joined(separator: ","))
 
         switch expectedStart {
-        case 0x0400:
-            // Only decode full live frames — must have at least 24 u16 words (byteCount=0x30).
-            guard byteCount >= 0x30 else {
-                appLogger.log("PARSER", "0x0400 frame too short byteCount=\(byteCount) — skipped")
+        case 0x03F2:
+            // Live frame from reg 1010 (0x03F2), count=40 words.
+            // Must have byteCount=0x50 (80 data bytes = 40 words).
+            guard byteCount >= 0x50 else {
+                appLogger.log("PARSER", "0x03F2 frame too short byteCount=\(byteCount) — skipped")
                 return false
             }
-            // Live flags are in u16(0) — the first word of the frame.
-            // u16(2) is the voltage fraction word (e.g. 66) — NOT flags.
-            let liveFlags = u16(0)
-            lastLiveFlags = liveFlags
 
-            // Voltage: IQ16 frac=u16(2), int=u16(3). Confirmed: reg1026=66,reg1027=74 → 74.001V
-            let voltage = fixedIntFrac(2, 3)
+            // Word layout (each IQ16 param: HIGH word = fraction, LOW word = integer):
+            // words 0,1   → 1010 Idref
+            // words 2,3   → 1012 Iqref
+            // words 4,5   → 1014 AccPedal (U32, throttle ADC 0–4096)
+            // words 6,7   → 1016 DebugEnable
+            // words 8,9   → 1018 EnableState (U32)
+            // words 10,11 → 1020 ModeState (U32: 0=throttle, 1=speed, 2=comm)
+            // words 12,13 → 1022 ActualSpeed (IQ16) — motor RPM (signed)
+            // words 14,15 → 1024 ActualTorque (IQ16)
+            // words 16,17 → 1026 Udc (IQ16) — bus voltage; HIGH word has embedded flags
+            // words 18,19 → 1028 Imag (IQ16) — phase current (peak)
+            // words 20,21 → 1030 MosTmp (IQ16) — controller (MOSFET) temp
+            // words 22,23 → 1032 MotorTmp (IQ16) — motor temp
+            // words 24,25 → 1034 Idfed (IQ16) — D-axis current
+            // words 26,27 → 1036 Iqfed (IQ16) — Q-axis current
+            // words 28,29 → 1038 Umag (IQ16) — phase voltage magnitude
+            // words 30,31 → 1040 IdEst (IQ16) — bus current estimate
+            // words 32,33 → 1042 Dangle (U32) — motor encoder angle
+            // words 34,35 → 1044 ZeroAngle (U32) — encoder zero offset
+            // words 36,37 → 1046 WarnCode (U32)
+            // words 38,39 → 1048 ErrCode (U32)
+
+            // Voltage: Udc IQ16 frac=u16(16), int=u16(17)
+            let voltage = fixedIntFrac(16, 17)
             if voltage >= 45 && voltage <= 95 {
-                telemetry.voltage = (voltage * 100.0).rounded() / 100.0
+                // Show 4 decimal places of IQ16 precision
+                telemetry.voltage = (voltage * 10000.0).rounded() / 10000.0
                 telemetry.batteryPercent = liIonSoc20s(telemetry.voltage)
                 telemetry.bmsSoc = telemetry.batteryPercent
             }
 
-            // Motor RPM: IQ16 frac=u16(4), int=u16(5). Official app shows 1 RPM at idle → floor not round.
-            let motorRPM = abs(fixedIntFrac(4, 5))
+            // Motor RPM: ActualSpeed IQ16 frac=u16(12), int=u16(13). Signed (negative = reverse).
+            let motorRPMRaw = fixedIntFrac(12, 13)
+            let motorRPM = abs(motorRPMRaw)
             telemetry.rpm = motorRPM >= 0.5 ? Int(motorRPM) : 0
             if telemetry.rpm == 0 {
                 telemetry.speedKmh = 0
@@ -781,73 +819,118 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.wheelRPM = motorRPM / finalDriveRatio
             }
 
-            // Controller temp: IQ16 frac=u16(6), int=u16(7).
-            let controllerT = fixedIntFrac(6, 7)
-            if controllerT >= 5 && controllerT <= 120 {
+            // Controller (MOSFET) temp: MosTmp IQ16 frac=u16(20), int=u16(21)
+            let controllerT = fixedIntFrac(20, 21)
+            if controllerT >= -40 && controllerT <= 150 {
                 telemetry.controllerTemp = (controllerT * 10.0).rounded() / 10.0
             }
 
-            // Motor temp: IQ16 frac=u16(8), int=u16(9).
-            let motorT = fixedIntFrac(8, 9)
-            if motorT >= 5 && motorT <= 120 {
+            // Motor temp: MotorTmp IQ16 frac=u16(22), int=u16(23)
+            let motorT = fixedIntFrac(22, 23)
+            if motorT >= -40 && motorT <= 150 {
                 telemetry.motorTemp = (motorT * 10.0).rounded() / 10.0
             }
 
-            // Current: IQ16 frac=u16(10), int=u16(11). abs — negative during regen.
-            let rawCurrent = abs(fixedIntFrac(10, 11))
+            // Phase current (Imag): IQ16 frac=u16(18), int=u16(19). High word has embedded flags
+            // but they are in the upper bits so integer precision is unaffected.
+            // abs() because current is negative during regenerative braking.
+            let rawCurrent = abs(fixedIntFrac(18, 19))
             if rawCurrent >= 0 && rawCurrent <= 500 {
-                telemetry.currentA = (rawCurrent * 10.0).rounded() / 10.0
+                telemetry.currentA = (rawCurrent * 100.0).rounded() / 100.0
             }
-            // 5V/15V not confirmed in live frame — read from reg 338 output poll.
 
-            let rawMotor = u16(18)
+            // D/Q axis currents for advanced info
+            telemetry.torque = abs(fixedIntFrac(24, 25))   // Idfed as proxy
+
+            // Phase voltage: Umag IQ16 frac=u16(28), int=u16(29)
+            let phaseV = fixedIntFrac(28, 29)
+            if phaseV >= 0 && phaseV <= 120 {
+                telemetry.phaseVoltage = (phaseV * 100.0).rounded() / 100.0
+            }
+
+            // Motor encoder angle: Dangle U32 (words 32,33)
+            // U32 = (u16(32) << 16) | u16(33)
+            let rawMotor = (u16(32) << 16) | u16(33)
             lastRawMotorCount = rawMotor
-            telemetry.motorAngle = rawMotor
-            let zero = u16(20)
-            telemetry.zeroAngle = zero
+            telemetry.motorAngle = rawMotor & 0x3FFF  // 14-bit encoder typical
 
-             // Lean angle: signed difference of two u16 encoder values → degrees.
-            // Cast both to UInt16 first so subtraction wraps correctly at 0/65535.
-            let angleDiff = Int16(bitPattern: UInt16(rawMotor) &- UInt16(zero))
-            telemetry.leanAngle = Double(angleDiff) * 360.0 / 65536.0
+            // Zero angle: ZeroAngle U32 (words 34,35)
+            let zero = (u16(34) << 16) | u16(35)
+            telemetry.zeroAngle = zero & 0x3FFF
 
-            // Throttle/brake state from flags.
-            telemetry.brakeActive = (liveFlags & 0x40) != 0
+            // Lean angle from encoder difference (encoder-based lean, not IMU).
+            // Use UInt32 wrapping subtraction to safely handle underflow.
+            let rawMotorU = UInt32(bitPattern: Int32(rawMotor & 0x3FFF))
+            let zeroU     = UInt32(bitPattern: Int32(zero     & 0x3FFF))
+            let angleDiffU = (rawMotorU &- zeroU) & 0x3FFF
+            // Re-interpret as signed 14-bit value: if ≥ 8192, it wraps negative
+            let angleDiffSigned = angleDiffU >= 8192 ? Int32(angleDiffU) - 16384 : Int32(angleDiffU)
+            telemetry.leanAngle = Double(angleDiffSigned) * 360.0 / 16384.0
 
-            // Park / Reverse from live flags.
-            // Confirmed: 0x04 = reverse. Park bit is not confirmed — detect by
-            // flags == 0 (no drive mode bits set) when speed is already 0.
-            if (liveFlags & 0x04) != 0 {
+            // Warning and error codes: WarnCode(36,37) ErrCode(38,39) — U32 HIGH+LOW
+            if regs.count > 37 {
+                telemetry.warningCode = (u16(36) << 16) | u16(37)
+            }
+            if regs.count > 39 {
+                telemetry.errorCode = (u16(38) << 16) | u16(39)
+            }
+
+            // Brake signal: Fn.OBrK is bit 5 of the HIGH word of Udc (u16(16)).
+            // The HIGH word contains IQ16 fraction + embedded flags; bit 5 = brake.
+            // Note: the fraction value may accidentally set this bit — treat as advisory only.
+            let udcHighWord = u16(16)
+            telemetry.brakeActive = (udcHighWord & 0x20) != 0
+
+            // Mode and gear from Udc HIGH word flags:
+            // Bit 7 = Fn.ORD (reverse/D), Bit 6 = Fn.OPD (P), Bits 3-4 = Fn.OSpdMod (0/1/2/3)
+            // ModeState (words 10,11) gives U32 operating mode:
+            //   0 = throttle (oil-gate) mode → speed mode bits determine eco/xc/sports
+            //   1 = speed mode
+            //   2 = communication control mode
+            let modeState = u16(11)   // LOW word of ModeState (integer part)
+            let spdModBits = (udcHighWord >> 3) & 0x03   // bits 3-4
+
+            if (udcHighWord & 0x80) != 0 {
+                // Fn.ORD set → reverse/D gear
                 telemetry.mode = .reverse
                 telemetry.reverseActive = true
                 telemetry.parkingActive = false
                 lastStableRideMode = .reverse
-            } else if liveFlags == 0 || (liveFlags & 0x20) != 0 {
-                // flags == 0 or explicit park bit: vehicle is in park
+            } else if (udcHighWord & 0x40) != 0 {
+                // Fn.OPD set → park gear
                 telemetry.mode = .park
                 telemetry.parkingActive = true
                 telemetry.reverseActive = false
-            } else if (liveFlags & 0x10) != 0 {
-                telemetry.mode = .sports
-                telemetry.speedModeRaw = 2
-                telemetry.parkingActive = false
-                telemetry.reverseActive = false
-                lastStableRideMode = .sports
-            } else if (liveFlags & 0x08) != 0 {
-                telemetry.mode = .xc
-                telemetry.speedModeRaw = 1
-                telemetry.parkingActive = false
-                telemetry.reverseActive = false
-                lastStableRideMode = .xc
             } else {
-                telemetry.mode = .eco
-                telemetry.speedModeRaw = 0
                 telemetry.parkingActive = false
                 telemetry.reverseActive = false
-                lastStableRideMode = .eco
+                // Speed mode from Fn.OSpdMod bits (3-4 of HIGH word)
+                switch spdModBits {
+                case 0:
+                    telemetry.mode = .eco
+                    telemetry.speedModeRaw = 0
+                    lastStableRideMode = .eco
+                case 1:
+                    telemetry.mode = .xc
+                    telemetry.speedModeRaw = 1
+                    lastStableRideMode = .xc
+                case 2, 3:
+                    telemetry.mode = .sports
+                    telemetry.speedModeRaw = 2
+                    lastStableRideMode = .sports
+                default:
+                    telemetry.mode = lastStableRideMode
+                    telemetry.speedModeRaw = { switch lastStableRideMode {
+                        case .eco: return 0; case .xc: return 1; default: return 2
+                    }}()
+                }
             }
 
-            telemetry.throttleOpen = telemetry.speedKmh <= 0.3 ? 0 : min(1.0, telemetry.speedKmh / 60.0)
+            // AccPedal: U32 throttle ADC 0–4096 (words 4,5)
+            let throttleADC = Double((u16(4) << 16) | u16(5))
+            telemetry.throttleOpen = min(1.0, max(0.0, throttleADC / 4096.0))
+
+            _ = modeState  // suppress unused warning
 
         case 0x0122:
             appLogger.log("MODEMAP", "0x0122 ignored; live flags control mode")
@@ -872,12 +955,45 @@ final class DunenBLEManager: NSObject, ObservableObject {
             }
 
         case 338:
-            // OVMon5V=reg344=word[6], OVMon15V=reg345=word[7]. Raw/10000 → volts.
-            if regs.count > 7 {
-                let v5  = Double(regs[6])
-                let v15 = Double(regs[7])
-                if v5  > 0 { telemetry.internal5V  = v5  / 10000.0 }
-                if v15 > 0 { telemetry.internal15V = v15 / 10000.0 }
+            // Function-code output parameter table polled at address 338, count=24.
+            // Each 32-bit IQ16 parameter uses two 16-bit words (HIGH=fraction, LOW=integer).
+            // Addresses relative to start 338:
+            //   regs[0],regs[1] → addr 338
+            //   regs[2],regs[3] → addr 340
+            //   regs[4],regs[5] → addr 342
+            //   regs[6],regs[7] → addr 344 (but OVKey is at addr 342 or 343?)
+            //
+            // From the controller parameter table:
+            //   OVKey (high-accuracy bus voltage) at register 343 → HIGH=regs[5], LOW=regs[6]
+            //   OVMon5V at register 344 → HIGH=regs[6], LOW=regs[7]  (wait, overlaps OVKey LOW)
+            //
+            // Registers 343 and 344 are consecutive 16-bit addresses. OVKey and OVMon5V are
+            // separate 32-bit parameters at EVEN addresses. Most likely:
+            //   OVKey    at address 342: HIGH=regs[4], LOW=regs[5] → IQ16
+            //   OVMon5V  at address 344: HIGH=regs[6], LOW=regs[7] → IQ16
+            //   OVMon15V at address 346: HIGH=regs[8], LOW=regs[9] → IQ16
+            //
+            // IQ16 convention: result = s16(LOW) + u16(HIGH)/65536.0
+            if regs.count > 9 {
+                // OVKey (high-accuracy bus voltage) — use to refine telemetry.voltage decimals
+                let ovKeyInt  = Double(Int16(bitPattern: UInt16(regs[5])))
+                let ovKeyFrac = Double(regs[4])
+                let ovKey = ovKeyInt + ovKeyFrac / 65536.0
+                if ovKey >= 45 && ovKey <= 95 {
+                    telemetry.voltage = (ovKey * 10000.0).rounded() / 10000.0
+                }
+
+                // OVMon5V (5V rail)
+                let v5int  = Double(Int16(bitPattern: UInt16(regs[7])))
+                let v5frac = Double(regs[6])
+                let v5 = v5int + v5frac / 65536.0
+                if v5 > 0 && v5 < 8 { telemetry.internal5V = (v5 * 10000.0).rounded() / 10000.0 }
+
+                // OVMon15V (15V rail)
+                let v15int  = Double(Int16(bitPattern: UInt16(regs[9])))
+                let v15frac = Double(regs[8])
+                let v15 = v15int + v15frac / 65536.0
+                if v15 > 0 && v15 < 20 { telemetry.internal15V = (v15 * 10000.0).rounded() / 10000.0 }
             }
 
         default:

@@ -45,7 +45,7 @@ struct DiagnosticsView: View {
                         row("Brake", ble.telemetry.brakeActive ? "Active" : "Off")
                         row("Gear", "\(ble.telemetry.gearInputRaw)")
                         row("BMS SOC", String(format: "%.0f %%", ble.telemetry.bmsSoc))
-                        row("Confirmed toggles", "99 / 211 / 212")
+                        row("Confirmed toggles", "194 / 418 / 420")
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }

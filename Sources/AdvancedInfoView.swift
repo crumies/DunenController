@@ -30,8 +30,8 @@ struct AdvancedInfoView: View {
                 GlassCard(glow: true) {
                     VStack(spacing: 12) {
                         row("RPM", "\(ble.telemetry.rpm)")
-                        row("Voltage", String(format: "%.2f V", ble.telemetry.voltage))
-                        row("Current", String(format: "%.1f A", ble.telemetry.currentA))
+                        row("Voltage", String(format: "%.4f V", ble.telemetry.voltage))
+                        row("Current (Imag)", String(format: "%.2f A", ble.telemetry.currentA))
                         row("Power", String(format: "%.1f kW", ble.telemetry.powerKw))
                         row("WarningCode", "\(ble.telemetry.warningCode)")
                         row("ErrCode", "\(ble.telemetry.errorCode)")
@@ -69,8 +69,8 @@ struct AdvancedInfoView: View {
                         row("Controller Temp", String(format: "%.1f °C", ble.telemetry.controllerTemp))
                         row("Wh/km Est.", String(format: "%.1f Wh/km", estimatedWhPerKm))
                         row("Range Est.", String(format: "%.0f km", estimatedRangeKm))
-                        row("5V Rail", String(format: "%.2f V", ble.telemetry.internal5V))
-                        row("12/15V Rail", String(format: "%.2f V", ble.telemetry.internal15V))
+                        row("5V Rail (OVMon5V)", String(format: "%.4f V", ble.telemetry.internal5V))
+                        row("15V Rail (OVMon15V)", String(format: "%.4f V", ble.telemetry.internal15V))
                         heatBar(value: ble.telemetry.controllerTemp)
                     }
                 }

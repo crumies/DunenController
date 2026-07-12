@@ -28,9 +28,13 @@ struct TuningParameter: Identifiable, Codable, Equatable {
         return abs(currentValue - pendingValue) > 0.0001
     }
 
+    // IDs are Modbus register addresses: address = (row - 2) * 2
+    // Row 99  → address (99-2)*2  = 194
+    // Row 211 → address (211-2)*2 = 418
+    // Row 212 → address (212-2)*2 = 420
     static let defaults: [TuningParameter] = [
-        .init(id: 99, internalName: "PIDLLDTorqCurveSet1", displayName: "Side Support Function", detail: "Kickstand / side support sensor function. 0 = Off, 1 = On.", group: .common, kind: .toggle, min: 0, max: 1, currentValue: nil, originalValue: nil, pendingValue: nil, isRisky: true),
-        .init(id: 211, internalName: "FunParm2", displayName: "Rollback Prevention", detail: "Anti sliding slope / rollback prevention function. 0 = Off, 1 = On.", group: .common, kind: .toggle, min: 0, max: 1, currentValue: nil, originalValue: nil, pendingValue: nil, isRisky: true),
-        .init(id: 212, internalName: "FunParm3", displayName: "Cruise Control", detail: "Cruise control enable. 0 = Off, 1 = On.", group: .common, kind: .toggle, min: 0, max: 1, currentValue: nil, originalValue: nil, pendingValue: nil, isRisky: true)
+        .init(id: 194, internalName: "PIDLLDTorqCurveSet1", displayName: "Side Support Function", detail: "Kickstand / side support sensor function. 0 = Off, 1 = On.", group: .common, kind: .toggle, min: 0, max: 1, currentValue: nil, originalValue: nil, pendingValue: nil, isRisky: true),
+        .init(id: 418, internalName: "FunParm2", displayName: "Rollback Prevention", detail: "Anti sliding slope / rollback prevention function. 0 = Off, 1 = On.", group: .common, kind: .toggle, min: 0, max: 1, currentValue: nil, originalValue: nil, pendingValue: nil, isRisky: true),
+        .init(id: 420, internalName: "FunParm3", displayName: "Cruise Control", detail: "Cruise control enable. 0 = Off, 1 = On.", group: .common, kind: .toggle, min: 0, max: 1, currentValue: nil, originalValue: nil, pendingValue: nil, isRisky: true)
     ]
 }

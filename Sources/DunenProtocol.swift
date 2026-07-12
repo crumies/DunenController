@@ -50,24 +50,48 @@ enum DunenProtocol {
     }
 
     static func tuningPollFrames() -> [Data] {
+        // Function-code parameter table: address = (row-2)*2.
+        // Row 99  → addr 194 = 0xC2 (Side Support / toggle params area)
+        // Row 211 → addr 418 = 0x1A2 (FunParm2 Rollback, FunParm3 Cruise)
         [
-            modbusReadFrame(start: 90, count: 24),
-            modbusReadFrame(start: 210, count: 24)
+            modbusReadFrame(start: 194, count: 24),
+            modbusReadFrame(start: 418, count: 24)
         ]
     }
 
-    static func writeParameterFrame(id: Int, value: Double) -> Data {
-        // Keep the previous write method conservative for now.
-        // Proper Modbus write will be added after one confirmed write capture.
-        let scaled = Int32((value * 100).rounded())
-        let lo = UInt8(id & 0xFF)
-        let hi = UInt8((id >> 8) & 0xFF)
-        let v0 = UInt8(UInt32(bitPattern: scaled) & 0xFF)
-        let v1 = UInt8((UInt32(bitPattern: scaled) >> 8) & 0xFF)
-        let v2 = UInt8((UInt32(bitPattern: scaled) >> 16) & 0xFF)
-        let v3 = UInt8((UInt32(bitPattern: scaled) >> 24) & 0xFF)
-        let bytes: [UInt8] = [0xAA, 0x55, 0x09, 0x21, lo, hi, v0, v1, v2, v3]
-        return Data(bytes + [checksum(bytes)])
+    /// Write a single 32-bit parameter using Modbus function 0x10 (write multiple registers).
+    /// id = Modbus register address (= (row - 2) * 2 from the parameter table).
+    /// For U32 params: value is the raw integer. For IQ16 params: value = decimal, encoded as Int32(value * 65536).
+    /// isIQ16: pass true for IQ16 fractional parameters, false for U32 integer parameters.
+    static func writeParameterFrame(id: Int, value: Double, isIQ16: Bool = false) -> Data {
+        // Modbus function 0x10: write 2 registers (one 32-bit param) at address id.
+        // Frame: [01] [10] [addrH] [addrL] [00] [02] [00] [dataH_hi] [dataH_lo] [dataL_hi] [dataL_lo] [CRCH] [CRCL]
+        // The 32-bit value is split into two 16-bit registers (HIGH then LOW).
+        let raw32: Int32
+        if isIQ16 {
+            // IQ16 encoding: (integer << 16) | (fraction * 65536)
+            // But DUNEN stores as HIGH=fraction, LOW=integer (per live frame analysis).
+            let intPart = Int32(value)
+            let fracPart = Int32(((value - Double(intPart)) * 65536.0).rounded())
+            raw32 = (fracPart << 16) | (intPart & 0xFFFF)
+        } else {
+            // U32: write integer value directly, HIGH=0, LOW=value
+            raw32 = Int32(value.rounded())
+        }
+        let u32 = UInt32(bitPattern: raw32)
+        let bytes: [UInt8] = [
+            0x01, 0x10,
+            UInt8((id >> 8) & 0xFF), UInt8(id & 0xFF),   // address
+            0x00, 0x02,                                     // number of registers = 2
+            0x00,                                           // reserved (byte count placeholder — NOT standard; see note)
+            UInt8((u32 >> 24) & 0xFF), UInt8((u32 >> 16) & 0xFF),  // HIGH register
+            UInt8((u32 >>  8) & 0xFF), UInt8( u32        & 0xFF)   // LOW register
+        ]
+        // Standard Modbus 0x10 includes byte count before data. Per protocol doc example:
+        // "01 10 02 E1 00 02 00 00 00 00 D4 8B" — byte count field is 0x00 at position [6].
+        // This matches the doc which shows Data6=0 (reserved/bytecount=0 in their notation).
+        let crc = crc16(bytes)
+        return Data(bytes + [UInt8(crc & 0xFF), UInt8((crc >> 8) & 0xFF)])
     }
 
     static func parseParameterValues(from data: Data, expectedStart: Int? = nil) -> [Int: Double] {
@@ -75,8 +99,9 @@ enum DunenProtocol {
         guard b.count >= 5 else { return [:] }
 
         // Modbus read response: 01 03 byteCount <register bytes> CRClo CRChi
-        // DUNEN tables use 32-bit values: 0x30 bytes = 12 parameters.
-        // Your log proved this because values are like 00 00 00 30, 00 00 00 34, etc.
+        // DUNEN function-code table: each 32-bit parameter = 2 × 16-bit Modbus registers.
+        // IQ16 encoding: HIGH 16-bit word = fraction, LOW 16-bit word = integer part.
+        // Address keys in the result map are Modbus addresses (= start + parameter_index * 2).
         if b[0] == 0x01 && b[1] == 0x03 {
             let byteCount = Int(b[2])
             guard b.count >= 3 + byteCount else { return [:] }
@@ -87,58 +112,19 @@ enum DunenProtocol {
 
             for i in 0..<(byteCount / 4) {
                 guard offset + 3 < b.count else { break }
-                let raw = Int32(bitPattern:
-                    (UInt32(b[offset]) << 24) |
-                    (UInt32(b[offset + 1]) << 16) |
-                    (UInt32(b[offset + 2]) << 8) |
-                    UInt32(b[offset + 3])
-                )
-                result[start + i] = scaleValue(id: start + i, raw32: raw)
+                // HIGH 16 bits (first two bytes) = IQ16 fraction word
+                let highWord = UInt16(b[offset]) << 8 | UInt16(b[offset + 1])
+                // LOW 16 bits (next two bytes) = integer word (signed)
+                let lowWord  = UInt16(b[offset + 2]) << 8 | UInt16(b[offset + 3])
+                let intPart  = Double(Int16(bitPattern: lowWord))
+                let fracPart = Double(highWord) / 65536.0
+                let address  = start + i * 2   // each 32-bit param spans 2 Modbus addresses
+                result[address] = intPart + fracPart
                 offset += 4
             }
             return result
         }
-
-                // Legacy/fallback guessed parser for older internal app packets.
-        var result: [Int: Double] = [:]
-        var i = 0
-        while i + 5 < b.count {
-            let id = Int(b[i]) | (Int(b[i + 1]) << 8)
-            let raw = Int32(bitPattern:
-                UInt32(b[i + 2]) |
-                (UInt32(b[i + 3]) << 8) |
-                (UInt32(b[i + 4]) << 16) |
-                (UInt32(b[i + 5]) << 24)
-            )
-            if id > 0 && id < 500 {
-                result[id] = Double(raw) / 100.0
-            }
-            i += 6
-        }
-        return result
-    }
-
-    private static func scaleValue(id: Int, raw32: Int32) -> Double {
-        let v = Double(raw32)
-
-        // Most DUNEN table values are raw integers or fixed-point.
-        // The UI sanity filter decides what is usable.
-        switch id {
-        case 311...321:
-            // OTorq (321): example value 1.8020 => raw is stored *10000
-            return v / 10000.0
-        case 282:
-            // IADin9: analog current sample, raw / 100.0
-            return v / 100.0
-        case 335, 336, 343, 344, 345:
-            // OVkey (343), OVMon5V (344), OVMon15V (345): raw / 100.0
-            return v / 100.0
-        case 362:
-            // OVechSpd: vehicle speed in km/h, raw / 100.0
-            return v / 100.0
-        default:
-            return v
-        }
+        return [:]
     }
 
     private static func checksum(_ bytes: [UInt8]) -> UInt8 {
