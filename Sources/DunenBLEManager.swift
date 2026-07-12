@@ -40,7 +40,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
     private var pollFrames: [(start: Int, data: Data)] = []
     private var pollIndex: Int = 0
     private var pendingReadStarts: [Int] = []
-    private var inFlightReadStart: Int?        // for 0x03FE live frame only
+    private var inFlightReadStart: Int?        // for 0x0400 live frame only
     private var inFlightSentAt: Date?
     private var outInFlightStart: Int?          // for output register block polls
     private var outInFlightSentAt: Date?
@@ -50,6 +50,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
     private var lastLiveNotifyAt: Date?
     private var lastStableRideMode: RideMode = .eco
     private var lastLiveFlags: Int = 0
+    private var didReceiveGearData: Bool = false   // true once block A (608) delivered valid gear
     private var modeStaticReadStep: Int = 0
     private var lastModeStaticReadAt: Date?
     private var liveProbeTick: Int = 0
@@ -270,6 +271,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
         pollIndex = 0
         liveProbeTick = 0
         outputPollIdx = 0
+        didReceiveGearData = false
 
         pollFrames = []
 
@@ -288,11 +290,12 @@ final class DunenBLEManager: NSObject, ObservableObject {
         // Block B (666, 4): temps
         // Block C (682, 6): OVkey, OVMon5V, OVMon15V
         // Block D (708,14): OSpdMod, OVechSpd
-        outputPollTimer = Timer.scheduledTimer(withTimeInterval: 0.9, repeats: true) { [weak self] _ in
+        outputPollTimer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: true) { [weak self] _ in
             guard let self else { return }
             DispatchQueue.main.async { self.requestOutputBlock() }
         }
-        appLogger.log("POLL", "Started live=0.35s outputBlock=0.9s")
+        outputPollTimer?.fire()   // fire immediately so first full cycle completes in ~2.8s not ~3.5s
+        appLogger.log("POLL", "Started live=0.35s outputBlock=0.7s")
     }
 
     private var didSendDunenTypeReads: Bool = false
@@ -347,7 +350,8 @@ final class DunenBLEManager: NSObject, ObservableObject {
     private func isDunenLivePrimaryFrame(_ data: Data) -> Bool {
         let b = [UInt8](data)
         // 0x0400 live frame: byteCount=0x30 (24 words = 48 data bytes), total 53 bytes.
-        // Disambiguate from output-table blocks (same size) by checking both temps are realistic.
+        // Disambiguate from output-table blocks (same size) by checking voltage is in range.
+        // Do NOT check temps — they can be < 5°C at cold start and would incorrectly reject the frame.
         guard b.count >= 53, b[0] == 0x01, b[1] == 0x03, b[2] == 0x30 else { return false }
 
         func u16(_ index: Int) -> Int {
@@ -360,14 +364,10 @@ final class DunenBLEManager: NSObject, ObservableObject {
             Double(Int16(bitPattern: UInt16(u16(whole)))) + Double(u16(frac)) / 65536.0
         }
 
-        // Voltage at words 2(frac),3(int); temps at 6,7 and 8,9
+        // Voltage at words 2(frac),3(int) must be in valid e-bike range (45–95V).
+        // Temps can be negative at cold start — no longer checked here.
         let voltage = fixed(2, 3)
-        let controllerT = fixed(6, 7)
-        let motorT = fixed(8, 9)
-
-        return voltage >= 45 && voltage <= 95 &&
-               controllerT >= 5 && controllerT <= 120 &&
-               motorT >= 5 && motorT <= 120
+        return voltage >= 45 && voltage <= 95
     }
 
     private func looksLikeBogusPatternPage(_ regs: [Int]) -> Bool {
@@ -396,6 +396,9 @@ final class DunenBLEManager: NSObject, ObservableObject {
         // OGear   (row 310) = controller's engaged gear (may lag behind selector)
         // OSpdMod (row 356) = speed mode 0=ECO, 1=XC, 2=SPORTS
         // Valid gear values from official app are 0, 2, 4 only.
+        // Guard: don't resolve until block A has actually been received (gearInputRaw defaults to 0
+        // which looks like park — we must not set park until we have real gear data).
+        guard didReceiveGearData else { return }
         let validGear = [0, 2, 4].contains(telemetry.gearInputRaw)
         guard validGear else {
             // Gear data not yet received — keep last stable mode
@@ -682,9 +685,24 @@ final class DunenBLEManager: NSObject, ObservableObject {
             return
         }
 
+        // Tuning reads are sent via writeCharacteristic (FFF2) while live polls go via
+        // notifyCharacteristic. Both responses arrive here. Check tuning FIRST so a pending
+        // tuning response isn't consumed as a live-poll response (both have byteCount=0x30).
+        if !pendingReadStarts.isEmpty {
+            let b2 = [UInt8](data)
+            let bc = b2.count >= 3 ? Int(b2[2]) : 0
+            // Each tuning block is 24 u16 = 48 bytes = byteCount 0x30
+            if bc == 0x30, let start = pendingReadStarts.first {
+                pendingReadStarts.removeFirst()
+                appLogger.log("PARSER", "tuning resp start=\(start) len=\(data.count)")
+                let values = DunenProtocol.parseParameterValues(from: data, expectedStart: start)
+                tuningStore?.applyReadValues(values)
+                return
+            }
+        }
+
         // Route the response to whoever sent the request.
-        // For the live 0x03F2 slot: only accept if byteCount==0x50 (80 bytes = 40 u16 words).
-        // Reject short/wrong-size responses so firmware strings don't get decoded as telemetry.
+        // Reject wrong-size live responses so they don't get decoded as telemetry.
         if let start = inFlightReadStart {
             let b2 = [UInt8](data)
             let bc = b2.count >= 3 ? Int(b2[2]) : 0
@@ -707,20 +725,6 @@ final class DunenBLEManager: NSObject, ObservableObject {
             appLogger.log("PARSER", "output-block resp start=\(start) len=\(data.count)")
             _ = decodeDunenPage(data, expectedStart: start)
             return
-        }
-
-        // Tuning read responses — pendingReadStarts holds Modbus addresses (194, 418, etc.)
-        if !pendingReadStarts.isEmpty {
-            let b2 = [UInt8](data)
-            let bc = b2.count >= 3 ? Int(b2[2]) : 0
-            // Each tuning block is 24 u16 = 48 bytes = byteCount 0x30
-            if bc == 0x30, let start = pendingReadStarts.first {
-                pendingReadStarts.removeFirst()
-                appLogger.log("PARSER", "tuning resp start=\(start) len=\(data.count)")
-                let values = DunenProtocol.parseParameterValues(from: data, expectedStart: start)
-                tuningStore?.applyReadValues(values)
-                return
-            }
         }
 
         if let start = probeInFlightStart {
@@ -818,8 +822,27 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
             // Live flags: brake, park, reverse, speed mode bits
             let liveFlags = u16(0)
-            let isBraking = (liveFlags & 0x40) != 0
-            telemetry.brakeActive = isBraking
+            lastLiveFlags = liveFlags
+            telemetry.brakeActive = (liveFlags & 0x40) != 0
+
+            // Use live flags as mode fallback ONLY before block A/D have been received.
+            // This prevents stale flags overriding correct output-table mode data.
+            if !didReceiveGearData {
+                if (liveFlags & 0x20) != 0 {
+                    telemetry.mode = .park
+                } else if (liveFlags & 0x04) != 0 {
+                    telemetry.mode = .reverse
+                } else if (liveFlags & 0x10) != 0 {
+                    telemetry.mode = .sports
+                    lastStableRideMode = .sports
+                } else if (liveFlags & 0x08) != 0 {
+                    telemetry.mode = .xc
+                    lastStableRideMode = .xc
+                } else {
+                    telemetry.mode = .eco
+                    lastStableRideMode = .eco
+                }
+            }
 
             // Motor RPM: ActualSpeed IQ16 words 4(frac),5(int). Signed — negative in reverse.
             let motorRPMRaw = iq16At(4)
@@ -843,22 +866,34 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.bmsSoc = telemetry.batteryPercent
             }
 
-            // Phase current (Imag): IQ16 words 10(frac),11(int). abs — negative during regen.
-            let rawCurrent = abs(iq16At(10))
+            // Phase current (Imag): IQ16 words 10(frac),11(int). Negative during regen.
+            let signedCurrent = iq16At(10)
+            let rawCurrent = abs(signedCurrent)
             if rawCurrent >= 0 && rawCurrent <= 500 {
                 telemetry.currentA = (rawCurrent * 100.0).rounded() / 100.0
             }
 
-            // Controller (MOSFET) temp: MosTmp IQ16 words 6(frac),7(int)
-            let controllerT = iq16At(6)
-            if controllerT >= -40 && controllerT <= 150 {
-                telemetry.controllerTemp = (controllerT * 10.0).rounded() / 10.0
+            // Regen level indicator: derived from regen current while braking.
+            // 0 = no regen, 1 = light (<5A), 2 = medium (<15A), 3 = strong (≥15A).
+            if telemetry.brakeActive && signedCurrent < -0.5 {
+                let regenA = abs(signedCurrent)
+                if regenA < 5   { telemetry.regenLevel = 1 }
+                else if regenA < 15 { telemetry.regenLevel = 2 }
+                else                { telemetry.regenLevel = 3 }
+            } else if !telemetry.brakeActive {
+                telemetry.regenLevel = 0
             }
 
-            // Motor temp: MotorTmp IQ16 words 8(frac),9(int)
+            // Controller (MOSFET) temp: MosTmp IQ16 words 6(frac),7(int). 1 decimal place.
+            let controllerT = iq16At(6)
+            if controllerT >= -40 && controllerT <= 150 {
+                telemetry.controllerTemp = (controllerT * 10.0).rounded(.toNearestOrAwayFromZero) / 10.0
+            }
+
+            // Motor temp: MotorTmp IQ16 words 8(frac),9(int). 1 decimal place.
             let motorT = iq16At(8)
             if motorT >= -40 && motorT <= 150 {
-                telemetry.motorTemp = (motorT * 10.0).rounded() / 10.0
+                telemetry.motorTemp = (motorT * 10.0).rounded(.toNearestOrAwayFromZero) / 10.0
             }
 
             // Motor encoder angle: word 18 (U16)
@@ -897,6 +932,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
             let gearOut = u16(9)
             telemetry.gearInputRaw = gearIn
             telemetry.gearRaw      = gearOut
+            didReceiveGearData = true   // unblock resolveGearAndRideMode()
 
             let acc = iq16At(10)
             if acc >= 0 && acc <= 1.5 { telemetry.throttleOpen = min(1.0, max(0.0, acc)) }
@@ -911,11 +947,11 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
             let motTmp = iq16At(0)
             if motTmp >= -40 && motTmp <= 150 {
-                telemetry.motorTemp = (motTmp * 10.0).rounded() / 10.0
+                telemetry.motorTemp = (motTmp * 10.0).rounded(.toNearestOrAwayFromZero) / 10.0
             }
             let mosTmp = iq16At(2)
             if mosTmp >= -40 && mosTmp <= 150 {
-                telemetry.controllerTemp = (mosTmp * 10.0).rounded() / 10.0
+                telemetry.controllerTemp = (mosTmp * 10.0).rounded(.toNearestOrAwayFromZero) / 10.0
             }
 
         case 682:
@@ -951,16 +987,12 @@ final class DunenBLEManager: NSObject, ObservableObject {
             //  (addr 720 = row 362; offset from 708 = 720-708 = 12 words ✓)
             guard regs.count >= 2 else { break }
 
-            let spdMod = u32At(0)
+            // OSpdMod is U16 in LOW word (same layout as OGearIn). Use u16(1).
+            let spdMod = u16(1)
             telemetry.speedModeRaw = spdMod
-            if telemetry.mode != .park && telemetry.mode != .reverse {
-                switch spdMod {
-                case 0: telemetry.mode = .eco;    lastStableRideMode = .eco
-                case 1: telemetry.mode = .xc;     lastStableRideMode = .xc
-                case 2: telemetry.mode = .sports; lastStableRideMode = .sports
-                default: break
-                }
-            }
+            // Store speed mode and let resolveGearAndRideMode apply it correctly
+            // (it guards against overriding park/reverse).
+            resolveGearAndRideMode()
 
             if regs.count >= 14 {
                 let vspd = iq16At(12)
@@ -1255,15 +1287,17 @@ private func reg32s(_ regs: [Int], idx: Int) -> Double {
 /// Breakpoints calibrated to real LG cell discharge curve; 74V = ~49%.
 /// Full = 84V (4.2V×20) = 100%, empty = 60V (3.0V×20) = 0%.
 private func liIonSoc20s(_ voltage: Double) -> Double {
-    // (voltage, soc%) breakpoints — real Li-ion curve is flat in the middle.
+    // (voltage, soc%) breakpoints calibrated to official DunenConfiger app.
+    // Confirmed: 79.36V = 77%, 74V = 48%.
     let curve: [(v: Double, soc: Double)] = [
         (84.0, 100.0),
         (82.0,  93.0),
         (80.5,  85.0),
+        (79.36, 77.0),  // ← confirmed: official app shows 77% at 79.36V
         (79.0,  75.0),
         (77.5,  65.0),
         (76.0,  57.0),
-        (74.0,  48.0),  // ← calibrated: bike BMS reads 48% at 74V
+        (74.0,  48.0),  // ← confirmed: bike BMS reads 48% at 74V
         (72.5,  40.0),
         (71.0,  30.0),
         (69.5,  20.0),
