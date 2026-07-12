@@ -192,19 +192,23 @@ final class DunenBLEManager: NSObject, ObservableObject {
             return
         }
         tuningStore?.markReading()
-        // Function-code parameter table: address = (row-2)*2.
-        // TuningParameter id=99 (row 99) → address (99-2)*2=194=0xC2.
-        // Read 24 words (= 12 parameters) starting at address 0xC2, covering rows 99–110.
-        let addr99 = (99 - 2) * 2    // 194 = 0xC2
-        pendingReadStarts.append(addr99)
-        p.writeValue(DunenProtocol.modbusReadFrame(start: addr99, count: 24), for: c, type: c.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self, weak p, weak c] in
+
+        // Read each tuning parameter with EXACT count to avoid byteCount=0x30 collision
+        // with the live frame (which also has byteCount=0x30).
+        // id=194 (row 99)  → count=2  → byteCount=4  (no collision)
+        // id=418 (row 211) → count=4  → byteCount=8  covers 418 AND 420 (row 212)
+        let addr194 = 194   // (99-2)*2
+        let addr418 = 418   // (211-2)*2
+
+        pendingReadStarts.append(addr194)
+        p.writeValue(DunenProtocol.modbusReadFrame(start: addr194, count: 2), for: c,
+                     type: c.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak self, weak p, weak c] in
             guard let self, let p, let c else { return }
-            // TuningParameter id=211 (row 211) → address (211-2)*2=418=0x1A2.
-            // TuningParameter id=212 (row 212) → address (212-2)*2=420=0x1A4 (adjacent, same block).
-            let addr211 = (211 - 2) * 2   // 418 = 0x1A2
-            self.pendingReadStarts.append(addr211)
-            p.writeValue(DunenProtocol.modbusReadFrame(start: addr211, count: 24), for: c, type: c.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse)
+            self.pendingReadStarts.append(addr418)
+            p.writeValue(DunenProtocol.modbusReadFrame(start: addr418, count: 4), for: c,
+                         type: c.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse)
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
@@ -352,7 +356,8 @@ final class DunenBLEManager: NSObject, ObservableObject {
         // 0x0400 live frame: byteCount=0x30 (24 words = 48 data bytes), total 53 bytes.
         // Disambiguate from output-table blocks (same size) by checking voltage is in range.
         // Do NOT check temps — they can be < 5°C at cold start and would incorrectly reject the frame.
-        guard b.count >= 53, b[0] == 0x01, b[1] == 0x03, b[2] == 0x30 else { return false }
+        // Allow b.count >= 51 (3 header + 48 data; CRC bytes may be absent on some BLE stacks).
+        guard b.count >= 51, b[0] == 0x01, b[1] == 0x03, b[2] == 0x30 else { return false }
 
         func u16(_ index: Int) -> Int {
             let o = 3 + index * 2
@@ -687,14 +692,16 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         // Tuning reads are sent via writeCharacteristic (FFF2) while live polls go via
         // notifyCharacteristic. Both responses arrive here. Check tuning FIRST so a pending
-        // tuning response isn't consumed as a live-poll response (both have byteCount=0x30).
+        // tuning response isn't consumed as a live-poll response.
+        // Tuning reads now use exact counts (count=2 or count=4) → byteCount=4 or 8,
+        // which can NEVER match the live frame byteCount=0x30. Accept any byteCount here.
         if !pendingReadStarts.isEmpty {
             let b2 = [UInt8](data)
             let bc = b2.count >= 3 ? Int(b2[2]) : 0
-            // Each tuning block is 24 u16 = 48 bytes = byteCount 0x30
-            if bc == 0x30, let start = pendingReadStarts.first {
+            // Accept any valid byteCount > 0; the live frame is already caught above by isDunenLivePrimaryFrame.
+            if bc > 0, let start = pendingReadStarts.first {
                 pendingReadStarts.removeFirst()
-                appLogger.log("PARSER", "tuning resp start=\(start) len=\(data.count)")
+                appLogger.log("PARSER", "tuning resp start=\(start) bc=\(bc) len=\(data.count)")
                 let values = DunenProtocol.parseParameterValues(from: data, expectedStart: start)
                 tuningStore?.applyReadValues(values)
                 return
@@ -926,10 +933,11 @@ final class DunenBLEManager: NSObject, ObservableObject {
             if outErr  > 0 { telemetry.errorCode   = outErr  }
             if outWarn > 0 { telemetry.warningCode  = outWarn }
 
-            // OGearIn and OGear are U16 values stored in the LOW word (odd index).
-            // Using u32At(even) gives 131072 for gear=2 — wrong. Use u16(odd) instead.
-            let gearIn = u16(7)
-            let gearOut = u16(9)
+            // OGearIn and OGear: U32 pair, value in HIGH word (even index).
+            // u32At(6) = (u16(6)<<16)|u16(7); for gear=2 this gives 131072=(2<<16).
+            // So the actual gear value is in u16(6) = HIGH word, not u16(7) = LOW word.
+            let gearIn = u16(6)
+            let gearOut = u16(8)
             telemetry.gearInputRaw = gearIn
             telemetry.gearRaw      = gearOut
             didReceiveGearData = true   // unblock resolveGearAndRideMode()
@@ -987,19 +995,18 @@ final class DunenBLEManager: NSObject, ObservableObject {
             //  (addr 720 = row 362; offset from 708 = 720-708 = 12 words ✓)
             guard regs.count >= 2 else { break }
 
-            // OSpdMod is U16 in LOW word (same layout as OGearIn). Use u16(1).
-            let spdMod = u16(1)
+            // OSpdMod: same U32-pair layout as OGearIn — value in HIGH word (even index).
+            let spdMod = u16(0)
             telemetry.speedModeRaw = spdMod
-            // Store speed mode and let resolveGearAndRideMode apply it correctly
-            // (it guards against overriding park/reverse).
-            resolveGearAndRideMode()
-
-            if regs.count >= 14 {
-                let vspd = iq16At(12)
-                if vspd >= 0 && vspd < 300 {
-                    telemetry.speedKmh = (vspd * 10.0).rounded() / 10.0
-                }
+            // Call resolveGearAndRideMode only if we already have real gear data from block A.
+            // This prevents block D (which fires first sometimes) setting mode from stale gear=0.
+            if didReceiveGearData {
+                resolveGearAndRideMode()
             }
+
+            // OVechSpd intentionally NOT used to set speedKmh — RPM-derived speed from the
+            // live 0x0400 frame is the reliable source. OVechSpd may reflect a different
+            // wheel/gearing calibration from the controller, causing speed to track throttle.
 
         case 0x03E8:
             // Heartbeat/enable frame — no telemetry fields decoded here.
