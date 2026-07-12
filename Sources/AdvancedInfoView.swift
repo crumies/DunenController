@@ -32,7 +32,7 @@ struct AdvancedInfoView: View {
                         row("RPM", "\(ble.telemetry.rpm)")
                         row("Voltage", String(format: "%.4f V", ble.telemetry.voltage))
                         row("Current (Imag)", String(format: "%.2f A", ble.telemetry.currentA))
-                        row("Power", String(format: "%.1f kW", ble.telemetry.powerKw))
+                        row("Power", ble.telemetry.powerKw > 0 ? String(format: "%.1f kW", ble.telemetry.powerKw) : "—")
                         row("WarningCode", "\(ble.telemetry.warningCode)")
                         row("ErrCode", "\(ble.telemetry.errorCode)")
                     }

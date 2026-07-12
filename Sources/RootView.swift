@@ -47,12 +47,21 @@ struct RootView: View {
                         .zIndex(8)
                 }
 
+                // "Reading Controller…" overlay — shown while connected but waiting
+                // for the first live telemetry packet. Fades out smoothly.
+                if ble.isConnected && !ble.isDemoMode && ble.isInitializing {
+                    ReadingControllerOverlay()
+                        .transition(.opacity)
+                        .zIndex(9)
+                }
+
                 if showSplash && settings.startupAnimation {
                     StartupSplash()
                         .transition(.opacity)
                         .zIndex(10)
                 }
             }
+            .animation(.easeInOut(duration: 0.35), value: ble.isInitializing)
         }
         .onAppear {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
@@ -60,6 +69,33 @@ struct RootView: View {
                     showSplash = false
                 }
             }
+        }
+    }
+}
+
+struct ReadingControllerOverlay: View {
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.72)
+                .ignoresSafeArea()
+
+            VStack(spacing: 18) {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .tint(.cyan)
+                    .scaleEffect(1.4)
+
+                Text("Reading Controller…")
+                    .font(.system(size: 17, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white)
+
+                Text("Waiting for first live packet")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.white.opacity(0.55))
+            }
+            .padding(32)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: 20))
         }
     }
 }

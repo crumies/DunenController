@@ -16,6 +16,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
     @Published var isScanning = false
     @Published var isConnected = false
     @Published var isDemoMode = false
+    @Published var isInitializing = false   // true while connected but no telemetry yet
     @Published var connectedName: String?
     @Published var telemetry = Telemetry()
     @Published var history = TelemetryHistory()
@@ -276,30 +277,26 @@ final class DunenBLEManager: NSObject, ObservableObject {
         liveProbeTick = 0
         outputPollIdx = 0
         didReceiveGearData = false
+        isInitializing = true
 
         pollFrames = []
 
-        // Fast timer: Table-2 live frame at 0x0400 count=24 (original working approach).
-        // This matches what the official app's live notify enable command activates.
-        // The controller pushes responses to this after the 0x03E8 enable write.
-        // liveFlags in u16(0) carries brake + mode bits (confirmed working pre-refactor).
+        // Fast timer: Table-2 live frame at 0x03FE (ActualSpeed/RPM), count=26.
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
             guard let self else { return }
             DispatchQueue.main.async { self.requestLiveOutput() }
         }
         pollTimer?.fire()
 
-        // Slower timer: rotates through 4 small output-table blocks (each ≤ 20 words).
-        // Block A (608,16): gear, err/warn, throttle
-        // Block B (666, 4): temps
-        // Block C (682, 6): OVkey, OVMon5V, OVMon15V
-        // Block D (708,14): OSpdMod, OVechSpd
-        outputPollTimer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: true) { [weak self] _ in
+        // Slower timer: rotates through 4 output-table blocks at 0.5s each.
+        // Order: C first (voltage), then A (gear/brake), B (temps), D (speed mode).
+        // This ensures OVkey voltage decimals arrive within the first 0.5s.
+        outputPollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             guard let self else { return }
             DispatchQueue.main.async { self.requestOutputBlock() }
         }
-        outputPollTimer?.fire()   // fire immediately so first full cycle completes in ~2.8s not ~3.5s
-        appLogger.log("POLL", "Started live=0.35s outputBlock=0.7s")
+        outputPollTimer?.fire()
+        appLogger.log("POLL", "Started live=0.35s outputBlock=0.5s rotation=C,A,B,D")
     }
 
     private var didSendDunenTypeReads: Bool = false
@@ -396,12 +393,13 @@ final class DunenBLEManager: NSObject, ObservableObject {
     }
 
     private func resolveGearAndRideMode() {
-        // OGearIn (row 309) = user's gear selector: 0=P/empty, 2=D, 4=R
-        // OGear   (row 310) = controller's engaged gear (may lag behind selector)
-        // OSpdMod (row 356) = speed mode 0=ECO, 1=XC, 2=SPORTS
-        // Valid gear values from official app are 0, 2, 4 only.
-        let validGear = [0, 2, 4].contains(telemetry.gearInputRaw)
-        guard validGear else { return }
+        // OGearIn (row 309): 0=Empty/Park, 1=D, 4=R  (confirmed from user's register map)
+        // OSpdMod (row 356): 0=ECO, 1=XC, 2=SPORTS
+        let validGear = [0, 1, 4].contains(telemetry.gearInputRaw)
+        guard validGear else {
+            appLogger.log("GEAR", "invalid gearInputRaw=\(telemetry.gearInputRaw) — skipping mode resolve")
+            return
+        }
 
         switch telemetry.gearInputRaw {
         case 4:   // R = reverse
@@ -409,11 +407,11 @@ final class DunenBLEManager: NSObject, ObservableObject {
             telemetry.reverseActive = true
             telemetry.parkingActive = false
             lastStableRideMode = .reverse
-        case 0:   // P = park / empty
+        case 0:   // Empty / Park
             telemetry.mode = .park
             telemetry.parkingActive = true
             telemetry.reverseActive = false
-        default:  // 2 = D — drive; use OSpdMod for eco/xc/sports
+        default:  // 1 = D — drive; use OSpdMod for eco/xc/sports
             telemetry.parkingActive = false
             telemetry.reverseActive = false
             switch telemetry.speedModeRaw {
@@ -430,6 +428,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.mode = lastStableRideMode
             }
         }
+        appLogger.log("GEAR", "gearIn=\(telemetry.gearInputRaw) gearOut=\(telemetry.gearRaw) spdMod=\(telemetry.speedModeRaw) → mode=\(telemetry.mode.rawValue)")
     }
 
     // Output-table poll addresses (Modbus address = (rowNo - 2) * 2).
@@ -437,26 +436,31 @@ final class DunenBLEManager: NSObject, ObservableObject {
     // Block A: addr 608 (row 306) count=16 → OStMode,OErrCode,OWarnCode,OGearIn,OGear,OACC
     // Block B: addr 666 (row 335) count=4  → OMotTmp(335), OMosTmp(336)
     // Block C: addr 682 (row 343) count=6  → OVkey(343), OVMon5V(344), OVMon15V(345)
-    // Block D: addr 708 (row 356) count=14 → OSpdMod(356) at offset 0; OVechSpd(362) at offset 12
-    // Block A starts at addr 600 = row 303 OXhFlag (handbrake), covering through row 313.
-    // Addr formula: (rowNo-2)*2. Row 303→600, row 306→608, row 309→614, row 313→622.
-    // Word offsets within block starting at 600:
+    // Output-table poll blocks, rotated by outputPollTimer.
+    // Order: C first so voltage decimals (OVkey) arrive in ~0.5s not ~2s.
+    // Addr formula: (rowNo-2)*2.
+    //
+    // Block C: addr 682 (row 343) count=6 → OVkey(343), OVMon5V(344), OVMon15V(345)
+    // Block A: addr 600 (row 303) count=22
+    //   Word offsets within block starting at 600:
     //   0,1  → row 303 OXhFlag  (U32: non-zero = handbrake active)
     //   2,3  → row 304 (unused)
     //   4,5  → row 305 (unused)
     //   6,7  → row 306 OStMode  (U32)
     //   8,9  → row 307 OErrCode (U32)
     //   10,11 → row 308 OWarnCode (U32)
-    //   12,13 → row 309 OGearIn  (U32: 0=P, 2=D, 4=R)
+    //   12,13 → row 309 OGearIn  (U32: 0=Empty, 1=D, 4=R)
     //   14,15 → row 310 OGear    (U32)
     //   16,17 → row 311 OACC     (IQ16: throttle 0-1)
     //   18,19 → row 312 OTorLimit
     //   20,21 → row 313 ODeratingK
+    // Block B: addr 666 (row 335) count=4 → OMotTmp(335), OMosTmp(336)
+    // Block D: addr 708 (row 356) count=14 → OSpdMod at word 0,1
     private let outputPollConfigs: [(start: Int, count: Int)] = [
-        (600, 22),   // A: OXhFlag(303),OStMode(306),OErrCode,OWarnCode,OGearIn,OGear,OACC
-        (666,  4),   // B: OMotTmp,OMosTmp (rows 335-336)
-        (682,  6),   // C: OVkey,OVMon5V,OVMon15V (rows 343-345)
-        (708, 14),   // D: OSpdMod at word 0,1; OVechSpd(row362→addr720) at word 12,13
+        (682,  6),   // C first: OVkey voltage arrives within 0.5s of connect
+        (600, 22),   // A: OXhFlag(brake),OStMode,OErrCode,OWarnCode,OGearIn,OGear,OACC
+        (666,  4),   // B: OMotTmp,OMosTmp
+        (708, 14),   // D: OSpdMod
     ]
     private var outputPollIdx = 0
 
@@ -511,13 +515,15 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         if let start = outInFlightStart {
             let age = Date().timeIntervalSince(outInFlightSentAt ?? Date())
-            if age < 1.2 {
-                appLogger.log("OUT-POLL", "Still waiting for reg \(start) response")
+            if age < 0.45 {
+                // Previous request still within window — don't pile up
                 return
             }
-            appLogger.log("OUT-POLL-TIMEOUT", "Dropping output block reg \(start)")
-            outInFlightStart = nil
-            outInFlightSentAt = nil
+            if age >= 0.45 {
+                appLogger.log("OUT-POLL-TIMEOUT", "reg=\(start) no response after \(String(format:"%.2f",age))s — advancing")
+                outInFlightStart = nil
+                outInFlightSentAt = nil
+            }
         }
 
         let cfg = outputPollConfigs[outputPollIdx % outputPollConfigs.count]
@@ -525,7 +531,8 @@ final class DunenBLEManager: NSObject, ObservableObject {
         let frame = DunenProtocol.modbusReadFrame(start: cfg.start, count: cfg.count)
         outInFlightStart = cfg.start
         outInFlightSentAt = Date()
-        appLogger.log("OUT-POLL", "Requesting output block addr=\(cfg.start) count=\(cfg.count)")
+        let expectedBC = cfg.count * 2
+        appLogger.log("OUT-POLL", "TX reg=\(cfg.start) count=\(cfg.count) expectedByteCount=\(expectedBC) [0x\(String(format:"%02X",expectedBC))]")
         let target = notifyCharacteristic ?? secondaryWriteCharacteristic ?? writeCharacteristic
         sendReadOnlyFrame(frame, via: target, peripheral: p, note: "output-block addr=\(cfg.start)")
     }
@@ -734,9 +741,15 @@ final class DunenBLEManager: NSObject, ObservableObject {
         }
 
         if let start = outInFlightStart {
+            let b2 = [UInt8](data)
+            let bc = b2.count >= 3 ? Int(b2[2]) : 0
+            let expectedBC = 2 * (outputPollConfigs.first(where: { $0.start == start })?.count ?? 0)
             outInFlightStart = nil
             outInFlightSentAt = nil
-            appLogger.log("PARSER", "output-block resp start=\(start) len=\(data.count)")
+            if expectedBC > 0 && bc != expectedBC {
+                appLogger.log("OUT-PARSE-WARN", "reg=\(start) expected byteCount=\(expectedBC) got=\(bc) len=\(data.count) — will attempt decode anyway")
+            }
+            appLogger.log("PARSER", "output-block resp reg=\(start) bc=\(bc) len=\(data.count)")
             _ = decodeDunenPage(data, expectedStart: start)
             return
         }
@@ -800,7 +813,8 @@ final class DunenBLEManager: NSObject, ObservableObject {
             regs.append(u16(i))
         }
 
-        appLogger.log("DUNEN-PAGE", "matchedStart=0x\(String(expectedStart, radix: 16)) regs=" + regs.enumerated().map { "\(expectedStart + $0.offset)=\($0.element)" }.joined(separator: ","))
+        let regDump = regs.enumerated().map { "r\(expectedStart + $0.offset)=\($0.element)" }.joined(separator: " ")
+        appLogger.log("DECODE-RAW", "start=\(expectedStart)(0x\(String(expectedStart,radix:16))) words=\(regs.count) | \(regDump)")
 
         // Helper: IQ16 value from a pair of words (HIGH=frac at even index, LOW=int at odd index)
         func iq16At(_ evenIdx: Int) -> Double {
@@ -835,9 +849,10 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 return false
             }
 
-            // Motor RPM: ActualSpeed IQ16 words 0(frac),1(int). Signed — negative in reverse.
+            // RPM: ActualSpeed IQ16 words 0(frac),1(int). Signed — negative in reverse.
             let motorRPMRaw = iq16At(0)
             let motorRPM = abs(motorRPMRaw)
+            let prevRPM = telemetry.rpm
             telemetry.rpm = motorRPM >= 0.5 ? Int(motorRPM) : 0
             if telemetry.rpm == 0 {
                 telemetry.speedKmh = 0
@@ -847,14 +862,16 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.speedKmh = (kmh * 10.0).rounded() / 10.0
                 telemetry.wheelRPM = motorRPM / finalDriveRatio
             }
+            appLogger.log("DECODE-LIVE", "RPM raw=\(String(format:"%.4f",motorRPMRaw)) → \(telemetry.rpm) (prev=\(prevRPM)) speed=\(String(format:"%.1f",telemetry.speedKmh))km/h")
 
             // Voltage: Udc IQ16 words 4(frac),5(int).
-            // OVkey (block C) updates with higher precision; only set here if block C hasn't run yet.
+            // Only used as initial seed — OVkey (block C) always overrides with 4dp precision.
             let udcVoltage = iq16At(4)
             if udcVoltage >= 45 && udcVoltage <= 95 && telemetry.voltage == 0 {
                 telemetry.voltage = (udcVoltage * 100.0).rounded() / 100.0
                 telemetry.batteryPercent = liIonSoc20s(telemetry.voltage)
                 telemetry.bmsSoc = telemetry.batteryPercent
+                appLogger.log("DECODE-LIVE", "voltage seed from Udc raw=\(String(format:"%.4f",udcVoltage)) → \(String(format:"%.2f",telemetry.voltage))V (seed only, OVkey takes over)")
             }
 
             // Phase current (Imag): IQ16 words 6(frac),7(int). Negative during regen.
@@ -863,9 +880,9 @@ final class DunenBLEManager: NSObject, ObservableObject {
             if rawCurrent >= 0 && rawCurrent <= 500 {
                 telemetry.currentA = (rawCurrent * 100.0).rounded() / 100.0
             }
+            appLogger.log("DECODE-LIVE", "Imag raw=\(String(format:"%.4f",signedCurrent)) → currentA=\(String(format:"%.2f",telemetry.currentA))A (scale:abs,round2dp)")
 
-            // Regen level indicator: derived from regen current while braking.
-            // 0 = no regen, 1 = light (<5A), 2 = medium (<15A), 3 = strong (≥15A).
+            // Regen level indicator from regen current while braking.
             if telemetry.brakeActive && signedCurrent < -0.5 {
                 let regenA = abs(signedCurrent)
                 if regenA < 5   { telemetry.regenLevel = 1 }
@@ -875,66 +892,72 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.regenLevel = 0
             }
 
-            // Controller (MOSFET) temp: MosTmp IQ16 words 8(frac),9(int). 1 decimal place.
+            // Controller temp: MosTmp IQ16 words 8(frac),9(int).
             let controllerT = iq16At(8)
             if controllerT >= -40 && controllerT <= 150 {
                 telemetry.controllerTemp = (controllerT * 10.0).rounded(.toNearestOrAwayFromZero) / 10.0
             }
+            appLogger.log("DECODE-LIVE", "MosTmp raw=\(String(format:"%.4f",controllerT)) → \(String(format:"%.1f",telemetry.controllerTemp))°C")
 
-            // Motor temp: MotorTmp IQ16 words 10(frac),11(int). 1 decimal place.
+            // Motor temp: MotorTmp IQ16 words 10(frac),11(int).
             let motorT = iq16At(10)
             if motorT >= -40 && motorT <= 150 {
                 telemetry.motorTemp = (motorT * 10.0).rounded(.toNearestOrAwayFromZero) / 10.0
             }
+            appLogger.log("DECODE-LIVE", "MotorTmp raw=\(String(format:"%.4f",motorT)) → \(String(format:"%.1f",telemetry.motorTemp))°C")
 
-            // Motor encoder angle: Dangle IQ16 words 20(frac),21(int). Take integer part only.
+            // Motor angle: Dangle IQ16 words 20(frac),21(int).
             let rawMotor = u16(21)
             lastRawMotorCount = rawMotor
             telemetry.motorAngle = rawMotor
-
-            // Zero angle: words 22,23 — take integer part (word 23).
             let zero = u16(23)
             telemetry.zeroAngle = zero
-
-            // Lean angle: encoder difference, treated as signed 16-bit.
             let angleDiff16 = Int32(Int16(bitPattern: UInt16((rawMotor - zero) & 0xFFFF)))
             telemetry.leanAngle = Double(angleDiff16) * 360.0 / 65536.0
 
+            // Only update history on the live frame — output blocks don't change RPM/speed
+            // so appending on every block would flood the graph with flat segments.
+            calculateDerived(dt: 0.20)
+            history.append(telemetry)
+            updateRideStats(dt: 0.20)
+            checkDiagnosticEvents()
+            if isInitializing { isInitializing = false }
+            appLogger.log("DISPLAY", "rpm=\(telemetry.rpm) spd=\(String(format:"%.1f",telemetry.speedKmh)) V=\(String(format:"%.4f",telemetry.voltage)) A=\(String(format:"%.2f",telemetry.currentA)) ctrlT=\(String(format:"%.1f",telemetry.controllerTemp)) motT=\(String(format:"%.1f",telemetry.motorTemp)) mode=\(telemetry.mode.rawValue) brake=\(telemetry.brakeActive) soc=\(String(format:"%.0f",telemetry.batteryPercent))%")
+            return true
+
         case 600:
-            // Output table Block A: addr 600 (row 303 OXhFlag), count=22
-            //  0,1  → row 303 OXhFlag   (U32: non-zero = handbrake active)
-            //  2,3  → row 304 (skip)
-            //  4,5  → row 305 (skip)
+            // Block A: addr 600 (row 303 OXhFlag) count=22
+            //  0,1  → row 303 OXhFlag   (U32: non-zero = handbrake)
             //  6,7  → row 306 OStMode   (U32)
             //  8,9  → row 307 OErrCode  (U32)
             //  10,11 → row 308 OWarnCode (U32)
-            //  12,13 → row 309 OGearIn   (U32: 0=P, 2=D, 4=R)
+            //  12,13 → row 309 OGearIn   (U32: 0=Empty, 1=D, 4=R)
             //  14,15 → row 310 OGear     (U32)
-            //  16,17 → row 311 OACC      (IQ16: throttle 0–1)
-            //  18,19 → row 312 OTorLimit
-            //  20,21 → row 313 ODeratingK
-            guard regs.count >= 14 else { break }
+            //  16,17 → row 311 OACC      (IQ16 throttle 0-1)
+            guard regs.count >= 14 else {
+                appLogger.log("DECODE-WARN", "block-A reg=600 too few words=\(regs.count) expected≥14")
+                break
+            }
 
-            // Brake: OXhFlag (handbrake flag) — non-zero = brake active.
             let xhFlag = u32At(0)
+            let prevBrake = telemetry.brakeActive
             telemetry.brakeActive = xhFlag != 0
+            appLogger.log("DECODE-A", "OXhFlag raw=\(xhFlag) → brakeActive=\(telemetry.brakeActive) (prev=\(prevBrake))")
 
             let outErr  = u32At(8)
             let outWarn = u32At(10)
-            if outErr  > 0 { telemetry.errorCode   = outErr  }
-            if outWarn > 0 { telemetry.warningCode  = outWarn }
+            if outErr  > 0 { telemetry.errorCode  = outErr  }
+            if outWarn > 0 { telemetry.warningCode = outWarn }
 
-            // OGearIn/OGear: full U32 — same as confirmed-working 2e33e5c which used
-            // u32At(6)/u32At(8) on block start=608. Block now starts at 600 so OGearIn
-            // (row 309, addr 614) is at word offset (614-600)/2=7 → u32At pair starts
-            // at even index 12. OGear (row 310, addr 616) → word offset 8 → u32At(14).
             let gearIn  = u32At(12)
             let gearOut = u32At(14)
             telemetry.gearInputRaw = gearIn
             telemetry.gearRaw      = gearOut
+            appLogger.log("DECODE-A", "OGearIn raw=\(gearIn) OGear raw=\(gearOut) (valid: 0=Empty 1=D 4=R)")
 
             let acc = iq16At(16)
             if acc >= 0 && acc <= 1.5 { telemetry.throttleOpen = min(1.0, max(0.0, acc)) }
+            appLogger.log("DECODE-A", "OACC raw=\(String(format:"%.4f",acc)) → throttle=\(String(format:"%.1f",telemetry.throttleOpen*100))%")
 
             resolveGearAndRideMode()
 
@@ -954,28 +977,38 @@ final class DunenBLEManager: NSObject, ObservableObject {
             }
 
         case 682:
-            // Output table Block C: addr 682 (row 343), count=6
-            //  0,1 → row 343 OVkey    (IQ16) → high-accuracy bus voltage
+            // Block C: addr 682 (row 343) count=6
+            //  0,1 → row 343 OVkey    (IQ16) → high-accuracy bus voltage (4dp)
             //  2,3 → row 344 OVMon5V  (IQ16) → 5V rail
             //  4,5 → row 345 OVMon15V (IQ16) → 15V rail
-            guard regs.count >= 6 else { break }
+            guard regs.count >= 6 else {
+                appLogger.log("DECODE-WARN", "block-C reg=682 too few words=\(regs.count) expected≥6")
+                break
+            }
 
             let vKey = iq16At(0)
+            appLogger.log("DECODE-C", "OVkey raw=\(String(format:"%.6f",vKey)) hi=\(regs[0]) lo=\(regs[1])")
             if vKey >= 45 && vKey <= 95 {
+                let prevV = telemetry.voltage
                 telemetry.voltage = (vKey * 10000.0).rounded() / 10000.0
                 telemetry.batteryPercent = liIonSoc20s(telemetry.voltage)
                 telemetry.bmsSoc = telemetry.batteryPercent
+                appLogger.log("DECODE-C", "voltage \(String(format:"%.4f",prevV))→\(String(format:"%.4f",telemetry.voltage))V soc=\(String(format:"%.0f",telemetry.batteryPercent))%")
+            } else {
+                appLogger.log("DECODE-C", "OVkey=\(String(format:"%.4f",vKey)) out of range [45-95] — skipped")
             }
 
             let v5 = iq16At(2)
             if v5 > 0 && v5 < 8 {
                 telemetry.internal5V = (v5 * 10000.0).rounded() / 10000.0
             }
+            appLogger.log("DECODE-C", "OVMon5V raw=\(String(format:"%.4f",v5)) → \(String(format:"%.4f",telemetry.internal5V))V")
 
             let v15 = iq16At(4)
             if v15 > 0 && v15 < 20 {
                 telemetry.internal15V = (v15 * 10000.0).rounded() / 10000.0
             }
+            appLogger.log("DECODE-C", "OVMon15V raw=\(String(format:"%.4f",v15)) → \(String(format:"%.4f",telemetry.internal15V))V")
 
         case 708:
             // Output table Block D: addr 708 (row 356), count=14
@@ -988,12 +1021,13 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
             let spdMod = u32At(0)
             telemetry.speedModeRaw = spdMod
+            appLogger.log("DECODE-D", "OSpdMod raw=\(spdMod) currentMode=\(telemetry.mode.rawValue)")
             if telemetry.mode != .park && telemetry.mode != .reverse {
                 switch spdMod {
                 case 0: telemetry.mode = .eco;    lastStableRideMode = .eco
                 case 1: telemetry.mode = .xc;     lastStableRideMode = .xc
                 case 2: telemetry.mode = .sports; lastStableRideMode = .sports
-                default: break
+                default: appLogger.log("DECODE-D", "OSpdMod=\(spdMod) unknown — keeping \(telemetry.mode.rawValue)")
                 }
             }
 
@@ -1019,12 +1053,12 @@ final class DunenBLEManager: NSObject, ObservableObject {
         telemetry.rawHex = data.map { String(format: "%02X", $0) }.joined(separator: " ")
         telemetry.packetCount += 1
 
+        // History and ride stats updated in the live frame case (0x03FE) only.
+        // Output block cases call return early above, so we only reach here for
+        // non-live-frame cases that fall through the switch without returning.
         calculateDerived(dt: 0.20)
-        history.append(telemetry)
         updateRideStats(dt: 0.20)
         checkDiagnosticEvents()
-
-        appLogger.log("DISPLAY", "speed=\(String(format: "%.1f", telemetry.speedKmh)) rawSpeed=\(String(format: "%.3f", lastRawDisplaySpeed)) rpm=\(telemetry.rpm) rawMotor=\(lastRawMotorCount) voltage=\(String(format: "%.2f", telemetry.voltage)) soc=\(String(format: "%.0f", telemetry.batteryPercent)) motorTemp=\(String(format: "%.0f", telemetry.motorTemp)) controllerTemp=\(String(format: "%.0f", telemetry.controllerTemp)) mode=\(telemetry.mode.rawValue) flags=\(lastLiveFlags) type=\(dunenControllerTypeString) err=\(telemetry.errorCode) warn=\(telemetry.warningCode)")
         return true
     }
 
@@ -1037,7 +1071,9 @@ final class DunenBLEManager: NSObject, ObservableObject {
     }
 
     private func calculateDerived(dt: Double) {
-        telemetry.powerKw = (telemetry.voltage * telemetry.currentA) / 1000.0
+        // Do NOT calculate power from amps — controller does not provide a kW register.
+        // Leave powerKw as 0 so UI can show "—" instead of a derived/inaccurate value.
+        telemetry.powerKw = 0
 
         if telemetry.bmsSoc > 0 && telemetry.bmsSoc <= 100 {
             telemetry.batteryPercent = telemetry.bmsSoc
