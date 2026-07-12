@@ -806,7 +806,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
             let zero = u16(20)
             telemetry.zeroAngle = zero
 
-            // Lean angle: signed difference of two u16 encoder values → degrees.
+             // Lean angle: signed difference of two u16 encoder values → degrees.
             // Cast both to UInt16 first so subtraction wraps correctly at 0/65535.
             let angleDiff = Int16(bitPattern: UInt16(rawMotor) &- UInt16(zero))
             telemetry.leanAngle = Double(angleDiff) * 360.0 / 65536.0
