@@ -924,16 +924,12 @@ final class DunenBLEManager: NSObject, ObservableObject {
             if outErr  > 0 { telemetry.errorCode   = outErr  }
             if outWarn > 0 { telemetry.warningCode  = outWarn }
 
-            // OGearIn: try HIGH word first (u16(12)), then LOW word (u16(13)).
-            // Accept whichever is in the valid set {0, 2, 4}. The encoding varies by
-            // firmware — this handles both HIGH-word and LOW-word layouts.
-            let gearHi = u16(12)
-            let gearLo = u16(13)
-            let validGears = [0, 2, 4]
-            let gearIn  = validGears.contains(gearHi) && gearHi != 0 ? gearHi :
-                          validGears.contains(gearLo) && gearLo != 0 ? gearLo :
-                          validGears.contains(gearHi) ? gearHi : gearLo
-            let gearOut = u16(15)
+            // OGearIn/OGear: full U32 — same as confirmed-working 2e33e5c which used
+            // u32At(6)/u32At(8) on block start=608. Block now starts at 600 so OGearIn
+            // (row 309, addr 614) is at word offset (614-600)/2=7 → u32At pair starts
+            // at even index 12. OGear (row 310, addr 616) → word offset 8 → u32At(14).
+            let gearIn  = u32At(12)
+            let gearOut = u32At(14)
             telemetry.gearInputRaw = gearIn
             telemetry.gearRaw      = gearOut
 
