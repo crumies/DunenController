@@ -438,8 +438,22 @@ final class DunenBLEManager: NSObject, ObservableObject {
     // Block B: addr 666 (row 335) count=4  → OMotTmp(335), OMosTmp(336)
     // Block C: addr 682 (row 343) count=6  → OVkey(343), OVMon5V(344), OVMon15V(345)
     // Block D: addr 708 (row 356) count=14 → OSpdMod(356) at offset 0; OVechSpd(362) at offset 12
+    // Block A starts at addr 600 = row 303 OXhFlag (handbrake), covering through row 313.
+    // Addr formula: (rowNo-2)*2. Row 303→600, row 306→608, row 309→614, row 313→622.
+    // Word offsets within block starting at 600:
+    //   0,1  → row 303 OXhFlag  (U32: non-zero = handbrake active)
+    //   2,3  → row 304 (unused)
+    //   4,5  → row 305 (unused)
+    //   6,7  → row 306 OStMode  (U32)
+    //   8,9  → row 307 OErrCode (U32)
+    //   10,11 → row 308 OWarnCode (U32)
+    //   12,13 → row 309 OGearIn  (U32: 0=P, 2=D, 4=R)
+    //   14,15 → row 310 OGear    (U32)
+    //   16,17 → row 311 OACC     (IQ16: throttle 0-1)
+    //   18,19 → row 312 OTorLimit
+    //   20,21 → row 313 ODeratingK
     private let outputPollConfigs: [(start: Int, count: Int)] = [
-        (608, 16),   // A: OStMode,OErrCode,OWarnCode,OGearIn,OGear,OACC (rows 306-313)
+        (600, 22),   // A: OXhFlag(303),OStMode(306),OErrCode,OWarnCode,OGearIn,OGear,OACC
         (666,  4),   // B: OMotTmp,OMosTmp (rows 335-336)
         (682,  6),   // C: OVkey,OVMon5V,OVMon15V (rows 343-345)
         (708, 14),   // D: OSpdMod at word 0,1; OVechSpd(row362→addr720) at word 12,13
@@ -886,30 +900,44 @@ final class DunenBLEManager: NSObject, ObservableObject {
             let angleDiff16 = Int32(Int16(bitPattern: UInt16((rawMotor - zero) & 0xFFFF)))
             telemetry.leanAngle = Double(angleDiff16) * 360.0 / 65536.0
 
-        case 608:
-            // Output table Block A: addr 608 (row 306), count=16
-            //  0,1 → row 306 OStMode  (U32)
-            //  2,3 → row 307 OErrCode (U32)
-            //  4,5 → row 308 OWarnCode (U32)
-            //  6,7 → row 309 OGearIn  (U32: 0=P, 2=D, 4=R)
-            //  8,9 → row 310 OGear    (U32)
-            //  10,11 → row 311 OACC   (IQ16: throttle 0–1)
-            //  12,13 → row 312 OTorLimit
-            //  14,15 → row 313 ODeratingK
-            guard regs.count >= 10 else { break }
+        case 600:
+            // Output table Block A: addr 600 (row 303 OXhFlag), count=22
+            //  0,1  → row 303 OXhFlag   (U32: non-zero = handbrake active)
+            //  2,3  → row 304 (skip)
+            //  4,5  → row 305 (skip)
+            //  6,7  → row 306 OStMode   (U32)
+            //  8,9  → row 307 OErrCode  (U32)
+            //  10,11 → row 308 OWarnCode (U32)
+            //  12,13 → row 309 OGearIn   (U32: 0=P, 2=D, 4=R)
+            //  14,15 → row 310 OGear     (U32)
+            //  16,17 → row 311 OACC      (IQ16: throttle 0–1)
+            //  18,19 → row 312 OTorLimit
+            //  20,21 → row 313 ODeratingK
+            guard regs.count >= 14 else { break }
 
-            let outErr  = u32At(2)
-            let outWarn = u32At(4)
+            // Brake: OXhFlag (handbrake flag) — non-zero = brake active.
+            let xhFlag = u32At(0)
+            telemetry.brakeActive = xhFlag != 0
+
+            let outErr  = u32At(8)
+            let outWarn = u32At(10)
             if outErr  > 0 { telemetry.errorCode   = outErr  }
             if outWarn > 0 { telemetry.warningCode  = outWarn }
 
-            // OGearIn and OGear are U16 values in the LOW word (odd index) — confirmed working.
-            let gearIn = u16(7)
-            let gearOut = u16(9)
+            // OGearIn: try HIGH word first (u16(12)), then LOW word (u16(13)).
+            // Accept whichever is in the valid set {0, 2, 4}. The encoding varies by
+            // firmware — this handles both HIGH-word and LOW-word layouts.
+            let gearHi = u16(12)
+            let gearLo = u16(13)
+            let validGears = [0, 2, 4]
+            let gearIn  = validGears.contains(gearHi) && gearHi != 0 ? gearHi :
+                          validGears.contains(gearLo) && gearLo != 0 ? gearLo :
+                          validGears.contains(gearHi) ? gearHi : gearLo
+            let gearOut = u16(15)
             telemetry.gearInputRaw = gearIn
             telemetry.gearRaw      = gearOut
 
-            let acc = iq16At(10)
+            let acc = iq16At(16)
             if acc >= 0 && acc <= 1.5 { telemetry.throttleOpen = min(1.0, max(0.0, acc)) }
 
             resolveGearAndRideMode()
@@ -996,6 +1024,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
         telemetry.packetCount += 1
 
         calculateDerived(dt: 0.20)
+        history.append(telemetry)
         updateRideStats(dt: 0.20)
         checkDiagnosticEvents()
 
