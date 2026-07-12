@@ -357,14 +357,15 @@ final class DunenBLEManager: NSObject, ObservableObject {
             Double(Int16(bitPattern: UInt16(u16(whole)))) + Double(u16(frac)) / 65536.0
         }
 
-        // Udc voltage: words 4(frac),5(int)
-        let voltage = fixed(4, 5)
+        // Udc voltage: integer from word 5, flag-masked fraction from word 4
+        let udcHigh = u16(4)
+        let udcVoltage = Double(Int16(bitPattern: UInt16(u16(5)))) + Double(udcHigh & 0xFF00) / 65536.0
         // MosTmp controller temp: words 8(frac),9(int)
         let controllerT = fixed(8, 9)
         // MotorTmp motor temp: words 10(frac),11(int)
         let motorT = fixed(10, 11)
 
-        return voltage >= 45 && voltage <= 95 &&
+        return udcVoltage >= 45 && udcVoltage <= 95 &&
                controllerT >= -40 && controllerT <= 150 &&
                motorT >= -40 && motorT <= 150
     }
@@ -430,12 +431,17 @@ final class DunenBLEManager: NSObject, ObservableObject {
         }
     }
 
-    // Output-table poll addresses (Modbus address = (rowNo - 2) * 2):
-    // Block A: addr 608 (row 306) count=30 → rows 306–320 (status, err/warn, gear, acc, torques)
-    // Block B: addr 666 (row 335) count=56 → rows 335–362 (temps, speed, OVkey, rails, mode, vehspd)
+    // Output-table poll addresses (Modbus address = (rowNo - 2) * 2).
+    // Each block kept small (≤ 20 words = 40 data bytes) to fit one BLE notification.
+    // Block A: addr 608 (row 306) count=16 → OStMode,OErrCode,OWarnCode,OGearIn,OGear,OACC
+    // Block B: addr 666 (row 335) count=4  → OMotTmp(335), OMosTmp(336)
+    // Block C: addr 682 (row 343) count=6  → OVkey(343), OVMon5V(344), OVMon15V(345)
+    // Block D: addr 708 (row 356) count=14 → OSpdMod(356) at offset 0; OVechSpd(362) at offset 12
     private let outputPollConfigs: [(start: Int, count: Int)] = [
-        (608, 30),    // rows 306–320: OStMode, OErrCode, OWarnCode, OGearIn, OGear, OACC, torques
-        (666, 56)     // rows 335–362: OMotTmp, OMosTmp, Ospeed0, OVkey, OVMon5V, OVMon15V, OSpdMod, OVechSpd
+        (608, 16),   // A: OStMode,OErrCode,OWarnCode,OGearIn,OGear,OACC (rows 306-313)
+        (666,  4),   // B: OMotTmp,OMosTmp (rows 335-336)
+        (682,  6),   // C: OVkey,OVMon5V,OVMon15V (rows 343-345)
+        (708, 14),   // D: OSpdMod at word 0,1; OVechSpd(row362→addr720) at word 12,13
     ]
     private var outputPollIdx = 0
 
@@ -827,10 +833,16 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.wheelRPM = motorRPM / finalDriveRatio
             }
 
-            // Voltage: Udc IQ16 words 4(frac),5(int)
-            let voltage = iq16At(4)
+            // Voltage: Udc IQ16 words 4(frac),5(int).
+            // The HIGH word (word 4) has Fn.* flag bits embedded alongside the IQ16 fraction.
+            // Mask out the known flag bits (bits 0–7) to get a clean fraction.
+            let udcRawHigh = u16(4)
+            let udcFracClean = Double(udcRawHigh & 0xFF00) / 65536.0  // keep only upper byte
+            let udcInt = Double(s16(5))
+            let voltage = udcInt + udcFracClean
             if voltage >= 45 && voltage <= 95 {
-                telemetry.voltage = (voltage * 10000.0).rounded() / 10000.0
+                // Use 2-decimal precision here; OVkey (block C) will refine to 4 decimals
+                telemetry.voltage = (voltage * 100.0).rounded() / 100.0
                 telemetry.batteryPercent = liIonSoc20s(telemetry.voltage)
                 telemetry.bmsSoc = telemetry.batteryPercent
             }
@@ -893,116 +905,96 @@ final class DunenBLEManager: NSObject, ObservableObject {
             // hasn't delivered gear data yet.
 
         case 608:
-            // Output table Block A: addr 608 (row 306) count=30, covers rows 306–320.
-            // All params are U32 (gear codes) or IQ16 (torque/throttle). Each spans 2 words.
-            // Word indices:
-            //  0,1  → row 306 OStMode (U32: system status; 3=standby, 4=not ready)
-            //  2,3  → row 307 OErrCode (U32)
-            //  4,5  → row 308 OWarnCode (U32)
-            //  6,7  → row 309 OGearIn (U32: gear input 0=empty/P, 2=D, 4=R)
-            //  8,9  → row 310 OGear (U32: current gear 0=empty, 2=D, 4=R)
-            //  10,11 → row 311 OACC (IQ16: accelerator opening 0–1)
-            //  12,13 → row 312 OTorLimit (IQ16)
-            //  14,15 → row 313 ODeratingK (IQ16)
-            //  16–29 → rows 314–320 torque commands (IQ16)
+            // Output table Block A: addr 608 (row 306), count=16
+            //  0,1 → row 306 OStMode  (U32)
+            //  2,3 → row 307 OErrCode (U32)
+            //  4,5 → row 308 OWarnCode (U32)
+            //  6,7 → row 309 OGearIn  (U32: 0=P, 2=D, 4=R)
+            //  8,9 → row 310 OGear    (U32)
+            //  10,11 → row 311 OACC   (IQ16: throttle 0–1)
+            //  12,13 → row 312 OTorLimit
+            //  14,15 → row 313 ODeratingK
             guard regs.count >= 10 else { break }
 
-            // System fault/warn codes from output table
             let outErr  = u32At(2)
             let outWarn = u32At(4)
             if outErr  > 0 { telemetry.errorCode   = outErr  }
-            if outWarn > 0 { telemetry.warningCode = outWarn }
+            if outWarn > 0 { telemetry.warningCode  = outWarn }
 
-            // Gear input (OGearIn) and current gear (OGear)
-            let gearIn  = u32At(6)
+            let gearIn = u32At(6)
             let gearOut = u32At(8)
             telemetry.gearInputRaw = gearIn
             telemetry.gearRaw      = gearOut
 
-            // Throttle opening (OACC)
             let acc = iq16At(10)
             if acc >= 0 && acc <= 1.5 { telemetry.throttleOpen = min(1.0, max(0.0, acc)) }
 
-            // Brake signal: OGearIn=0 (P-gear) or a dedicated brake output register.
-            // No explicit brake output register visible — keep existing brakeActive from Table-2 flags.
-
-            // Mode and gear resolution
             resolveGearAndRideMode()
 
         case 666:
-            // Output table Block B: addr 666 (row 335) count=56, covers rows 335–362.
-            // Word offsets from base 666 (addr 666 = row 335):
-            //  0,1  → row 335 OMotTmp (IQ16) → motor temp
-            //  2,3  → row 336 OMosTmp (IQ16) → controller temp
-            //  4,5  → row 337 (reserved)
-            //  6,7  → row 338 Ospeed0 (IQ16) → motor speed (raw, same as RPM at low speed)
-            //  16,17 → row 343 OVkey (IQ16) → high-accuracy bus voltage
-            //  18,19 → row 344 OVMon5V (IQ16) → 5V rail
-            //  20,21 → row 345 OVMon15V (IQ16) → 15V rail
-            //  42,43 → row 356 OSpdMod (U32: 0=low/eco, 1=mid/xc, 2=high/sports)
-            //  54,55 → row 362 OVechSpd (IQ16) → vehicle speed km/h
-            guard regs.count >= 8 else { break }
+            // Output table Block B: addr 666 (row 335), count=4
+            //  0,1 → row 335 OMotTmp  (IQ16) → motor temp
+            //  2,3 → row 336 OMosTmp  (IQ16) → controller temp
+            guard regs.count >= 4 else { break }
 
-            // Motor temp (OMotTmp)
             let motTmp = iq16At(0)
             if motTmp >= -40 && motTmp <= 150 {
                 telemetry.motorTemp = (motTmp * 10.0).rounded() / 10.0
             }
-
-            // Controller temp (OMosTmp)
             let mosTmp = iq16At(2)
             if mosTmp >= -40 && mosTmp <= 150 {
                 telemetry.controllerTemp = (mosTmp * 10.0).rounded() / 10.0
             }
 
-            // OVkey: high-accuracy bus voltage (IQ16) — overrides Table-2 voltage for precision
-            if regs.count > 17 {
-                let vKey = iq16At(16)
-                if vKey >= 45 && vKey <= 95 {
-                    telemetry.voltage = (vKey * 10000.0).rounded() / 10000.0
-                    telemetry.batteryPercent = liIonSoc20s(telemetry.voltage)
-                    telemetry.bmsSoc = telemetry.batteryPercent
+        case 682:
+            // Output table Block C: addr 682 (row 343), count=6
+            //  0,1 → row 343 OVkey    (IQ16) → high-accuracy bus voltage
+            //  2,3 → row 344 OVMon5V  (IQ16) → 5V rail
+            //  4,5 → row 345 OVMon15V (IQ16) → 15V rail
+            guard regs.count >= 6 else { break }
+
+            let vKey = iq16At(0)
+            if vKey >= 45 && vKey <= 95 {
+                telemetry.voltage = (vKey * 10000.0).rounded() / 10000.0
+                telemetry.batteryPercent = liIonSoc20s(telemetry.voltage)
+                telemetry.bmsSoc = telemetry.batteryPercent
+            }
+
+            let v5 = iq16At(2)
+            if v5 > 0 && v5 < 8 {
+                telemetry.internal5V = (v5 * 10000.0).rounded() / 10000.0
+            }
+
+            let v15 = iq16At(4)
+            if v15 > 0 && v15 < 20 {
+                telemetry.internal15V = (v15 * 10000.0).rounded() / 10000.0
+            }
+
+        case 708:
+            // Output table Block D: addr 708 (row 356), count=14
+            //  0,1  → row 356 OSpdMod  (U32: 0=eco, 1=xc, 2=sports)
+            //  2,3  → row 357 ...
+            //  ...
+            //  12,13 → row 362 OVechSpd (IQ16) → vehicle speed km/h
+            //  (addr 720 = row 362; offset from 708 = 720-708 = 12 words ✓)
+            guard regs.count >= 2 else { break }
+
+            let spdMod = u32At(0)
+            telemetry.speedModeRaw = spdMod
+            if telemetry.mode != .park && telemetry.mode != .reverse {
+                switch spdMod {
+                case 0: telemetry.mode = .eco;    lastStableRideMode = .eco
+                case 1: telemetry.mode = .xc;     lastStableRideMode = .xc
+                case 2: telemetry.mode = .sports; lastStableRideMode = .sports
+                default: break
                 }
             }
 
-            // OVMon5V (5V rail)
-            if regs.count > 19 {
-                let v5 = iq16At(18)
-                if v5 > 0 && v5 < 8 { telemetry.internal5V = (v5 * 10000.0).rounded() / 10000.0 }
-            }
-
-            // OVMon15V (15V rail)
-            if regs.count > 21 {
-                let v15 = iq16At(20)
-                if v15 > 0 && v15 < 20 { telemetry.internal15V = (v15 * 10000.0).rounded() / 10000.0 }
-            }
-
-            // OSpdMod (speed mode: 0=eco, 1=xc, 2=sports)
-            if regs.count > 43 {
-                let spdMod = u32At(42)
-                telemetry.speedModeRaw = spdMod
-                // Only update mode if we're not in Park/Reverse (which come from gearIn)
-                if telemetry.mode != .park && telemetry.mode != .reverse {
-                    switch spdMod {
-                    case 0: telemetry.mode = .eco;    lastStableRideMode = .eco
-                    case 1: telemetry.mode = .xc;     lastStableRideMode = .xc
-                    case 2: telemetry.mode = .sports; lastStableRideMode = .sports
-                    default: break
-                    }
-                }
-            }
-
-            // OVechSpd (vehicle speed km/h)
-            if regs.count > 55 {
-                let vspd = iq16At(54)
+            if regs.count >= 14 {
+                let vspd = iq16At(12)
                 if vspd >= 0 && vspd < 300 {
                     telemetry.speedKmh = (vspd * 10.0).rounded() / 10.0
                 }
-            }
-
-            // Seat signal (OZuoTong row 366: addr 728, offset from 666 = 62 words)
-            if regs.count > 63 {
-                telemetry.seatSignalActive = u32At(62) != 0
             }
 
         case 0x03E8:
