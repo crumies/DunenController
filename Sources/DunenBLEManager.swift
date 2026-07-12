@@ -769,9 +769,9 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.bmsSoc = telemetry.batteryPercent
             }
 
-            // Motor RPM: IQ16 frac=u16(4), int=u16(5). Confirmed: 2 RPM at idle (stationary) ✓
+            // Motor RPM: IQ16 frac=u16(4), int=u16(5). Official app shows 1 RPM at idle → floor not round.
             let motorRPM = abs(fixedIntFrac(4, 5))
-            telemetry.rpm = motorRPM >= 1 ? Int(motorRPM.rounded()) : 0
+            telemetry.rpm = motorRPM >= 0.5 ? Int(motorRPM) : 0
             if telemetry.rpm == 0 {
                 telemetry.speedKmh = 0
                 telemetry.wheelRPM = 0
@@ -800,13 +800,17 @@ final class DunenBLEManager: NSObject, ObservableObject {
             }
             // 5V/15V not confirmed in live frame — read from reg 338 output poll.
 
-            let rawMotor = abs(s16(18))
-            lastRawMotorCount = rawMotor
-            telemetry.motorAngle = rawMotor
-            telemetry.zeroAngle = u16(20)
+            let rawMotor = s16(18)
+            lastRawMotorCount = abs(rawMotor)
+            telemetry.motorAngle = abs(rawMotor)
+            let zero = u16(20)
+            telemetry.zeroAngle = zero
 
-            // wheelRPM derived from motor RPM and drive ratio
-            telemetry.wheelRPM = telemetry.rpm > 0 ? Double(telemetry.rpm) / finalDriveRatio : 0
+            // Lean angle: signed difference between motorAngle and zeroAngle,
+            // mapped from 16-bit encoder range (0–65535 = 0–360°) to degrees.
+            // Wraps correctly using signed 16-bit arithmetic.
+            let angleDiff = Int16(bitPattern: UInt16(truncatingIfNeeded: abs(rawMotor) &- zero))
+            telemetry.leanAngle = Double(angleDiff) * 360.0 / 65536.0
 
             // Throttle/brake state from flags.
             telemetry.brakeActive = (liveFlags & 0x40) != 0
@@ -844,7 +848,6 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 lastStableRideMode = .eco
             }
 
-            telemetry.leanAngle = 0
             telemetry.throttleOpen = telemetry.speedKmh <= 0.3 ? 0 : min(1.0, telemetry.speedKmh / 60.0)
 
         case 0x0122:
@@ -910,9 +913,8 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         telemetry.voltageSag = max(0, lastVoltage - telemetry.voltage)
 
-        // Do NOT zero rpm/speed here — they are set by the decoder directly.
+        // Do NOT zero rpm/speed/leanAngle here — set by the decoder directly.
         telemetry.gForce = 0
-        telemetry.leanAngle = 0
         telemetry.theoreticalTopSpeedKmh = 136.0
 
         lastSpeedKmh = telemetry.speedKmh
