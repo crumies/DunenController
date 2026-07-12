@@ -769,11 +769,16 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.bmsSoc = telemetry.batteryPercent
             }
 
-            // Indices 4/5: confirmed throttle %, NOT RPM. Don't use as RPM.
-            // Store as throttleOpen (0–1). Value like 2.016 at idle = 2% throttle.
-            let throttleVal = fixedIntFrac(4, 5)
-            if throttleVal >= 0 && throttleVal <= 100 {
-                telemetry.throttleOpen = (throttleVal / 100.0 * 10.0).rounded() / 10.0
+            // Motor RPM: IQ16 frac=u16(4), int=u16(5). Confirmed: 2 RPM at idle (stationary) ✓
+            let motorRPM = abs(fixedIntFrac(4, 5))
+            telemetry.rpm = motorRPM >= 1 ? Int(motorRPM.rounded()) : 0
+            if telemetry.rpm == 0 {
+                telemetry.speedKmh = 0
+                telemetry.wheelRPM = 0
+            } else {
+                let kmh = motorRPM * kmhPerMotorRPM
+                telemetry.speedKmh = (kmh * 10.0).rounded() / 10.0
+                telemetry.wheelRPM = motorRPM / finalDriveRatio
             }
 
             // Controller temp: IQ16 frac=u16(6), int=u16(7).
