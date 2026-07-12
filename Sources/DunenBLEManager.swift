@@ -400,14 +400,8 @@ final class DunenBLEManager: NSObject, ObservableObject {
         // OGear   (row 310) = controller's engaged gear (may lag behind selector)
         // OSpdMod (row 356) = speed mode 0=ECO, 1=XC, 2=SPORTS
         // Valid gear values from official app are 0, 2, 4 only.
-        // Guard: don't resolve until block A has actually been received (gearInputRaw defaults to 0
-        // which looks like park — we must not set park until we have real gear data).
-        guard didReceiveGearData else { return }
         let validGear = [0, 2, 4].contains(telemetry.gearInputRaw)
-        guard validGear else {
-            // Gear data not yet received — keep last stable mode
-            return
-        }
+        guard validGear else { return }
 
         switch telemetry.gearInputRaw {
         case 4:   // R = reverse
@@ -909,14 +903,11 @@ final class DunenBLEManager: NSObject, ObservableObject {
             if outErr  > 0 { telemetry.errorCode   = outErr  }
             if outWarn > 0 { telemetry.warningCode  = outWarn }
 
-            // OGearIn and OGear: U32 pair, value in HIGH word (even index).
-            // u32At(6) = (u16(6)<<16)|u16(7); for gear=2 this gives 131072=(2<<16).
-            // So the actual gear value is in u16(6) = HIGH word, not u16(7) = LOW word.
-            let gearIn = u16(6)
-            let gearOut = u16(8)
+            // OGearIn and OGear are U16 values in the LOW word (odd index) — confirmed working.
+            let gearIn = u16(7)
+            let gearOut = u16(9)
             telemetry.gearInputRaw = gearIn
             telemetry.gearRaw      = gearOut
-            didReceiveGearData = true   // unblock resolveGearAndRideMode()
 
             let acc = iq16At(10)
             if acc >= 0 && acc <= 1.5 { telemetry.throttleOpen = min(1.0, max(0.0, acc)) }
@@ -971,13 +962,15 @@ final class DunenBLEManager: NSObject, ObservableObject {
             //  (addr 720 = row 362; offset from 708 = 720-708 = 12 words ✓)
             guard regs.count >= 2 else { break }
 
-            // OSpdMod: same U32-pair layout as OGearIn — value in HIGH word (even index).
-            let spdMod = u16(0)
+            let spdMod = u32At(0)
             telemetry.speedModeRaw = spdMod
-            // Call resolveGearAndRideMode only if we already have real gear data from block A.
-            // This prevents block D (which fires first sometimes) setting mode from stale gear=0.
-            if didReceiveGearData {
-                resolveGearAndRideMode()
+            if telemetry.mode != .park && telemetry.mode != .reverse {
+                switch spdMod {
+                case 0: telemetry.mode = .eco;    lastStableRideMode = .eco
+                case 1: telemetry.mode = .xc;     lastStableRideMode = .xc
+                case 2: telemetry.mode = .sports; lastStableRideMode = .sports
+                default: break
+                }
             }
 
             // OVechSpd intentionally NOT used to set speedKmh — RPM-derived speed from the
