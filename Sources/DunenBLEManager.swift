@@ -685,7 +685,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 pendingReadStarts.removeFirst()
                 appLogger.log("PARSER", "tuning resp start=\(start) len=\(data.count)")
                 let values = DunenProtocol.parseParameterValues(from: data, expectedStart: start)
-                tuningStore?.applyControllerValues(values)
+                tuningStore?.applyReadValues(values)
                 return
             }
         }
@@ -800,16 +800,15 @@ final class DunenBLEManager: NSObject, ObservableObject {
             }
             // 5V/15V not confirmed in live frame — read from reg 338 output poll.
 
-            let rawMotor = s16(18)
-            lastRawMotorCount = abs(rawMotor)
-            telemetry.motorAngle = abs(rawMotor)
+            let rawMotor = u16(18)
+            lastRawMotorCount = rawMotor
+            telemetry.motorAngle = rawMotor
             let zero = u16(20)
             telemetry.zeroAngle = zero
 
-            // Lean angle: signed difference between motorAngle and zeroAngle,
-            // mapped from 16-bit encoder range (0–65535 = 0–360°) to degrees.
-            // Wraps correctly using signed 16-bit arithmetic.
-            let angleDiff = Int16(bitPattern: UInt16(truncatingIfNeeded: abs(rawMotor) &- zero))
+            // Lean angle: signed difference of two u16 encoder values → degrees.
+            // Cast both to UInt16 first so subtraction wraps correctly at 0/65535.
+            let angleDiff = Int16(bitPattern: UInt16(rawMotor) &- UInt16(zero))
             telemetry.leanAngle = Double(angleDiff) * 360.0 / 65536.0
 
             // Throttle/brake state from flags.
