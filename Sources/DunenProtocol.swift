@@ -100,8 +100,11 @@ enum DunenProtocol {
 
         // Modbus read response: 01 03 byteCount <register bytes> CRClo CRChi
         // DUNEN function-code table: each 32-bit parameter = 2 × 16-bit Modbus registers.
-        // IQ16 encoding: HIGH 16-bit word = fraction, LOW 16-bit word = integer part.
-        // Address keys in the result map are Modbus addresses (= start + parameter_index * 2).
+        // Tuning parameters are plain integers (0/1 toggle, small unsigned values).
+        // Decode as plain U32: value = (HIGH << 16) | LOW, then round to nearest integer.
+        // We check both HIGH and LOW words — the toggle value (0 or 1) could be in either.
+        // If HIGH==0 take LOW directly; if LOW==0 and HIGH is a small integer take HIGH.
+        // This handles both storage layouts seen in DUNEN firmware.
         if b[0] == 0x01 && b[1] == 0x03 {
             let byteCount = Int(b[2])
             guard b.count >= 3 + byteCount else { return [:] }
@@ -112,14 +115,20 @@ enum DunenProtocol {
 
             for i in 0..<(byteCount / 4) {
                 guard offset + 3 < b.count else { break }
-                // HIGH 16 bits (first two bytes) = IQ16 fraction word
-                let highWord = UInt16(b[offset]) << 8 | UInt16(b[offset + 1])
-                // LOW 16 bits (next two bytes) = integer word (signed)
-                let lowWord  = UInt16(b[offset + 2]) << 8 | UInt16(b[offset + 3])
-                let intPart  = Double(Int16(bitPattern: lowWord))
-                let fracPart = Double(highWord) / 65536.0
-                let address  = start + i * 2   // each 32-bit param spans 2 Modbus addresses
-                result[address] = intPart + fracPart
+                let highWord = Int(UInt16(b[offset]) << 8 | UInt16(b[offset + 1]))
+                let lowWord  = Int(UInt16(b[offset + 2]) << 8 | UInt16(b[offset + 3]))
+                // Prefer LOW word if it holds the value; fall back to HIGH word.
+                // Both 0 → value is 0. HIGH non-zero and LOW zero → value is in HIGH.
+                let value: Double
+                if lowWord != 0 {
+                    value = Double(lowWord)
+                } else if highWord != 0 {
+                    value = Double(highWord)
+                } else {
+                    value = 0
+                }
+                let address = start + i * 2
+                result[address] = value
                 offset += 4
             }
             return result

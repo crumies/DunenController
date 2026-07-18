@@ -393,9 +393,10 @@ final class DunenBLEManager: NSObject, ObservableObject {
     }
 
     private func resolveGearAndRideMode() {
-        // OGearIn (row 309): 0=Empty/Park, 1=D, 4=R  (confirmed from user's register map)
+        // OGearIn (row 309): 0=Empty/Park, 1 or 2=D, 4=R
+        // Accept both 1 and 2 as Drive — firmware versions differ on which value means D.
         // OSpdMod (row 356): 0=ECO, 1=XC, 2=SPORTS
-        let validGear = [0, 1, 4].contains(telemetry.gearInputRaw)
+        let validGear = [0, 1, 2, 4].contains(telemetry.gearInputRaw)
         guard validGear else {
             appLogger.log("GEAR", "invalid gearInputRaw=\(telemetry.gearInputRaw) — skipping mode resolve")
             return
@@ -411,7 +412,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
             telemetry.mode = .park
             telemetry.parkingActive = true
             telemetry.reverseActive = false
-        default:  // 1 = D — drive; use OSpdMod for eco/xc/sports
+        default:  // 1 or 2 = D — drive; use OSpdMod for eco/xc/sports
             telemetry.parkingActive = false
             telemetry.reverseActive = false
             switch telemetry.speedModeRaw {
@@ -939,21 +940,25 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 break
             }
 
-            let xhFlag = u32At(0)
+            // OXhFlag: brake active when either HIGH or LOW word is non-zero.
+            let xhHi = u16(0); let xhLo = u16(1)
             let prevBrake = telemetry.brakeActive
-            telemetry.brakeActive = xhFlag != 0
-            appLogger.log("DECODE-A", "OXhFlag raw=\(xhFlag) → brakeActive=\(telemetry.brakeActive) (prev=\(prevBrake))")
+            telemetry.brakeActive = (xhHi | xhLo) != 0
+            appLogger.log("DECODE-A", "OXhFlag hi=\(xhHi) lo=\(xhLo) → brakeActive=\(telemetry.brakeActive) (prev=\(prevBrake))")
 
             let outErr  = u32At(8)
             let outWarn = u32At(10)
             if outErr  > 0 { telemetry.errorCode  = outErr  }
             if outWarn > 0 { telemetry.warningCode = outWarn }
 
-            let gearIn  = u32At(12)
-            let gearOut = u32At(14)
+            // OGearIn: value is a small integer (0,1,2,4). Read both HIGH and LOW words;
+            // use whichever is non-zero and small. Logs show which word the firmware uses.
+            let gearHi = u16(12); let gearLo = u16(13)
+            let gearIn = gearLo != 0 ? gearLo : gearHi
+            let gearOut = u16(15)   // OGear LOW word
             telemetry.gearInputRaw = gearIn
             telemetry.gearRaw      = gearOut
-            appLogger.log("DECODE-A", "OGearIn raw=\(gearIn) OGear raw=\(gearOut) (valid: 0=Empty 1=D 4=R)")
+            appLogger.log("DECODE-A", "OGearIn hi=\(gearHi) lo=\(gearLo) → gearIn=\(gearIn) | OGear lo=\(gearOut)")
 
             let acc = iq16At(16)
             if acc >= 0 && acc <= 1.5 { telemetry.throttleOpen = min(1.0, max(0.0, acc)) }
@@ -1019,9 +1024,11 @@ final class DunenBLEManager: NSObject, ObservableObject {
             //  (addr 720 = row 362; offset from 708 = 720-708 = 12 words ✓)
             guard regs.count >= 2 else { break }
 
-            let spdMod = u32At(0)
+            // OSpdMod: small integer (0=ECO,1=XC,2=SPORTS). Read both words; prefer non-zero.
+            let spdHi = u16(0); let spdLo = u16(1)
+            let spdMod = spdLo != 0 ? spdLo : spdHi
             telemetry.speedModeRaw = spdMod
-            appLogger.log("DECODE-D", "OSpdMod raw=\(spdMod) currentMode=\(telemetry.mode.rawValue)")
+            appLogger.log("DECODE-D", "OSpdMod hi=\(spdHi) lo=\(spdLo) → spdMod=\(spdMod) currentMode=\(telemetry.mode.rawValue)")
             if telemetry.mode != .park && telemetry.mode != .reverse {
                 switch spdMod {
                 case 0: telemetry.mode = .eco;    lastStableRideMode = .eco
