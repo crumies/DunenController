@@ -732,21 +732,25 @@ final class DunenBLEManager: NSObject, ObservableObject {
         }
 
         // Route the response to whoever sent the request.
-        // Reject wrong-size live responses so they don't get decoded as telemetry.
+        // If a wrong-size packet arrives while inFlightReadStart=0x0400, it is an output block
+        // response that arrived in the same window. Clear inFlightReadStart and fall through to
+        // the outInFlightStart handler so it is decoded correctly (not silently dropped).
         if let start = inFlightReadStart {
             let b2 = [UInt8](data)
             let bc = b2.count >= 3 ? Int(b2[2]) : 0
-            // 0x0400 live frame expects byteCount=0x30 (24 words×2); reject wrong-size responses
             if start == 0x0400 && bc != 0x30 {
-                appLogger.log("PARSER", "live-resp rejected wrong byteCount=\(bc) for 0x0400 — not a live frame")
-                // don't clear inFlightReadStart — wait for the real frame
+                // Not the live frame — clear in-flight and fall through to outInFlightStart.
+                appLogger.log("PARSER", "live-inFlight byteCount=\(bc)≠0x30 — clearing live in-flight, routing to output handler")
+                inFlightReadStart = nil
+                inFlightSentAt = nil
+                // fall through (no return) to outInFlightStart block below
+            } else {
+                inFlightReadStart = nil
+                inFlightSentAt = nil
+                appLogger.log("PARSER", "live-resp start=0x\(String(start, radix: 16)) len=\(data.count)")
+                _ = decodeDunenPage(data, expectedStart: start)
                 return
             }
-            inFlightReadStart = nil
-            inFlightSentAt = nil
-            appLogger.log("PARSER", "live-resp start=0x\(String(start, radix: 16)) len=\(data.count)")
-            _ = decodeDunenPage(data, expectedStart: start)
-            return
         }
 
         if let start = outInFlightStart {
@@ -855,10 +859,18 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 return false
             }
 
-            // liveFlags: bit 0x40 = brake, 0x10 = Sports, 0x08 = XC, 0x20 = Park, 0x04 = R
-            let liveFlags = u16(0)
-            lastLiveFlags = liveFlags
-            telemetry.brakeActive = (liveFlags & 0x40) != 0
+            // Words 0,1: IQ16 parameter (d-axis / q-axis current).
+            // When braking, this goes significantly negative. Use as brake indicator.
+            // OXhFlag in block A provides a second source; whichever fires first wins.
+            let brakeSenseWord = iq16At(0)
+            lastLiveFlags = Int(brakeSenseWord * 100)  // stored for debug
+            if brakeSenseWord < -0.3 {
+                telemetry.brakeActive = true
+            } else if brakeSenseWord > 0.3 {
+                // Driving forward — clear brake
+                telemetry.brakeActive = false
+            }
+            // If brakeSenseWord ≈ 0 (idle), leave brakeActive unchanged; block A OXhFlag is authoritative.
 
             // Voltage: Udc IQ16 words 2(frac),3(int).
             // Only used as initial seed — OVkey (block C) always overrides with 4dp precision.
@@ -917,14 +929,14 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.regenLevel = 0
             }
 
-            // Motor angle: words 18 (raw u16) and 20 (zero angle raw u16).
+            // Motor angle: word 18 = raw u16 rotor position counter.
+            // Use raw value directly — the zero-angle subtraction produced incorrect lean output.
             let rawMotor = u16(18)
             lastRawMotorCount = rawMotor
             telemetry.motorAngle = rawMotor
             let zero = u16(20)
             telemetry.zeroAngle = zero
-            let angleDiff16 = Int32(Int16(bitPattern: UInt16((rawMotor - zero) & 0xFFFF)))
-            telemetry.leanAngle = Double(angleDiff16) * 360.0 / 65536.0
+            telemetry.leanAngle = Double(rawMotor)
 
             // Only update history on the live frame — output blocks don't change RPM/speed
             // so appending on every block would flood the graph with flat segments.
@@ -950,16 +962,17 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 break
             }
 
-            // OXhFlag: handbrake signal. Combine with live-frame brake bit (liveFlags 0x40).
-            // Do NOT override to false here — live frame sets brakeActive from liveFlags every 0.35s.
-            // Only set to true if OXhFlag is non-zero; never force to false from this block.
+            // OXhFlag (row 303): handbrake signal at words 0,1.
+            // Non-zero = brake lever pressed. Set brakeActive; only clear if BOTH words are zero.
             let xhHi = u16(0); let xhLo = u16(1)
             let prevBrake = telemetry.brakeActive
-            if (xhHi | xhLo) != 0 { telemetry.brakeActive = true }
+            telemetry.brakeActive = (xhHi | xhLo) != 0
             appLogger.log("DECODE-A", "OXhFlag hi=\(xhHi) lo=\(xhLo) → brakeActive=\(telemetry.brakeActive) (prev=\(prevBrake))")
 
-            let outErr  = u32At(8)
-            let outWarn = u32At(10)
+            // OErrCode (row 307, words 8,9): read LOW word only — U32 value is in LOW word.
+            // u32At(8) gives (HIGH<<16)|LOW = huge wrong number if HIGH is non-zero.
+            let outErr  = u16(9)    // LOW word of OErrCode
+            let outWarn = u16(11)   // LOW word of OWarnCode
             if outErr  > 0 { telemetry.errorCode  = outErr  }
             if outWarn > 0 { telemetry.warningCode = outWarn }
 
