@@ -458,20 +458,22 @@ final class DunenBLEManager: NSObject, ObservableObject {
     //   2,3  → row 304 (unused)
     //   4,5  → row 305 (unused)
     //   6,7  → row 306 OStMode  (U32)
-    //   8,9  → row 307 OErrCode (U32)
-    //   10,11 → row 308 OWarnCode (U32)
-    //   12,13 → row 309 OGearIn  (U32: 0=Empty, 1=D, 4=R)
+    //   8,9  → row 307 OErrCode (U32, read LOW word=u16(9))
+    //   10,11 → row 308 OWarnCode (U32, read LOW word=u16(11))
+    //   12,13 → row 309 OGearIn  (U32: 0=Park, 2=Drive, 4=Reverse)
     //   14,15 → row 310 OGear    (U32)
     //   16,17 → row 311 OACC     (IQ16: throttle 0-1)
     //   18,19 → row 312 OTorLimit
     //   20,21 → row 313 ODeratingK
     // Block B: addr 666 (row 335) count=4 → OMotTmp(335), OMosTmp(336)
-    // Block D: addr 708 (row 356) count=14 → OSpdMod at word 0,1
+    // Block D: addr 708 (row 356) count=14 → OSpdMod(356) word 0,1; OVechSpd(362) word 12,13
+    // Block E: addr 576 (row 290) count=2  → OBrK brake signal
     private let outputPollConfigs: [(start: Int, count: Int)] = [
         (682,  6),   // C first: OVkey voltage arrives within 0.5s of connect
         (600, 22),   // A: OXhFlag(brake),OStMode,OErrCode,OWarnCode,OGearIn,OGear,OACC
         (666,  4),   // B: OMotTmp,OMosTmp
-        (708, 14),   // D: OSpdMod
+        (708, 14),   // D: OSpdMod + OVechSpd
+        (576,  2),   // E: OBrK brake signal (row 290 → addr (290-2)*2=576)
     ]
     private var outputPollIdx = 0
 
@@ -859,18 +861,10 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 return false
             }
 
-            // Words 0,1: IQ16 parameter (d-axis / q-axis current).
-            // When braking, this goes significantly negative. Use as brake indicator.
-            // OXhFlag in block A provides a second source; whichever fires first wins.
-            let brakeSenseWord = iq16At(0)
-            lastLiveFlags = Int(brakeSenseWord * 100)  // stored for debug
-            if brakeSenseWord < -0.3 {
-                telemetry.brakeActive = true
-            } else if brakeSenseWord > 0.3 {
-                // Driving forward — clear brake
-                telemetry.brakeActive = false
-            }
-            // If brakeSenseWord ≈ 0 (idle), leave brakeActive unchanged; block A OXhFlag is authoritative.
+            // Words 0,1: IQ16 parameter in this frame (not reliable for brake sensing).
+            // Brake is determined solely by OBrK (block E addr 576) and OXhFlag (block A addr 600).
+            // Store word01 for debug only.
+            lastLiveFlags = (u16(0) << 16) | u16(1)
 
             // Voltage: Udc IQ16 words 2(frac),3(int).
             // Only used as initial seed — OVkey (block C) always overrides with 4dp precision.
@@ -883,19 +877,14 @@ final class DunenBLEManager: NSObject, ObservableObject {
             }
 
             // RPM: ActualSpeed IQ16 words 4(frac),5(int). Signed — negative in reverse.
+            // Only update rpm and wheelRPM here. speedKmh comes from OVechSpd (block D) which
+            // is the controller's own calibrated speed — accurate and stable.
             let motorRPMRaw = iq16At(4)
             let motorRPM = abs(motorRPMRaw)
             let prevRPM = telemetry.rpm
             telemetry.rpm = motorRPM >= 0.5 ? Int(motorRPM) : 0
-            if telemetry.rpm == 0 {
-                telemetry.speedKmh = 0
-                telemetry.wheelRPM = 0
-            } else {
-                let kmh = motorRPM * kmhPerMotorRPM
-                telemetry.speedKmh = (kmh * 10.0).rounded() / 10.0
-                telemetry.wheelRPM = motorRPM / finalDriveRatio
-            }
-            appLogger.log("DECODE-LIVE", "RPM raw=\(String(format:"%.4f",motorRPMRaw)) → \(telemetry.rpm) (prev=\(prevRPM)) speed=\(String(format:"%.1f",telemetry.speedKmh))km/h")
+            telemetry.wheelRPM = motorRPM > 0 ? motorRPM / finalDriveRatio : 0
+            appLogger.log("DECODE-LIVE", "RPM raw=\(String(format:"%.4f",motorRPMRaw)) → \(telemetry.rpm) (prev=\(prevRPM))")
 
             // Controller temp: MosTmp IQ16 words 6(frac),7(int).
             let controllerT = iq16At(6)
@@ -969,12 +958,12 @@ final class DunenBLEManager: NSObject, ObservableObject {
             telemetry.brakeActive = (xhHi | xhLo) != 0
             appLogger.log("DECODE-A", "OXhFlag hi=\(xhHi) lo=\(xhLo) → brakeActive=\(telemetry.brakeActive) (prev=\(prevBrake))")
 
-            // OErrCode (row 307, words 8,9): read LOW word only — U32 value is in LOW word.
-            // u32At(8) gives (HIGH<<16)|LOW = huge wrong number if HIGH is non-zero.
+            // OErrCode (row 307, words 8,9): value is in LOW word only.
+            // Always update (including 0 = clear) so stale errors are removed.
             let outErr  = u16(9)    // LOW word of OErrCode
             let outWarn = u16(11)   // LOW word of OWarnCode
-            if outErr  > 0 { telemetry.errorCode  = outErr  }
-            if outWarn > 0 { telemetry.warningCode = outWarn }
+            telemetry.errorCode  = outErr
+            telemetry.warningCode = outWarn
 
             // OGearIn: value is a small integer (0,1,2,4). Read both HIGH and LOW words;
             // use whichever is non-zero and small. Logs show which word the firmware uses.
@@ -1042,27 +1031,37 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         case 708:
             // Output table Block D: addr 708 (row 356), count=14
-            //  0,1  → row 356 OSpdMod  (U32: 0=eco, 1=xc, 2=sports)
-            //  2,3  → row 357 ...
-            //  ...
+            //  0,1  → row 356 OSpdMod  (U32: 0=ECO, 1=XC, 2=SPORTS) — LOW word
             //  12,13 → row 362 OVechSpd (IQ16) → vehicle speed km/h
-            //  (addr 720 = row 362; offset from 708 = 720-708 = 12 words ✓)
+            //  (addr 720 = row 362; offset from block start = (720-708)/2 = 6 pairs = word 12,13)
             guard regs.count >= 2 else { break }
 
-            // OSpdMod: small integer (0=ECO,1=XC,2=SPORTS). Read both words; prefer non-zero.
-            // Prefer LOW word; if both zero → ECO (spdMod=0).
-            let spdHi = u16(0); let spdLo = u16(1)
-            let spdMod = spdLo != 0 ? spdLo : spdHi   // 0 is a valid value (ECO)
+            // OSpdMod: small U32. Value is in LOW word (u16(1)). HIGH word (u16(0)) is IQ16 frac.
+            let spdMod = u16(1)   // LOW word = integer value (0=ECO,1=XC,2=SPORTS)
             telemetry.speedModeRaw = spdMod
-            appLogger.log("DECODE-D", "OSpdMod hi=\(spdHi) lo=\(spdLo) → spdMod=\(spdMod) currentMode=\(telemetry.mode.rawValue)")
+            appLogger.log("DECODE-D", "OSpdMod hi=\(u16(0)) lo=\(u16(1)) → spdMod=\(spdMod) currentMode=\(telemetry.mode.rawValue)")
+
+            // OVechSpd: IQ16 vehicle speed in km/h at words 12(frac),13(int).
+            // Use as primary speed when available — more accurate than RPM-derived estimate.
+            if regs.count >= 14 {
+                let vechSpd = iq16At(12)
+                if vechSpd >= 0 && vechSpd < 300 {
+                    telemetry.speedKmh = (vechSpd * 10.0).rounded() / 10.0
+                    appLogger.log("DECODE-D", "OVechSpd raw=\(String(format:"%.4f",vechSpd)) → \(String(format:"%.1f",telemetry.speedKmh))km/h")
+                }
+            }
 
             // Always call resolveGearAndRideMode — it gates park/reverse via gearInputRaw.
-            // Do NOT guard against .park here; resolveGearAndRideMode handles all cases.
             resolveGearAndRideMode()
 
-            // OVechSpd intentionally NOT used to set speedKmh — RPM-derived speed from the
-            // live 0x0400 frame is the reliable source. OVechSpd may reflect a different
-            // wheel/gearing calibration from the controller, causing speed to track throttle.
+        case 576:
+            // Block E: OBrK (row 290) brake signal. addr=(290-2)*2=576, count=2 → words 0,1.
+            // OBrK is a U32; non-zero LOW word (u16(1)) = brake pressed.
+            guard regs.count >= 2 else { break }
+            let brkLo = u16(1)   // LOW word of OBrK
+            let prevBrakeE = telemetry.brakeActive
+            telemetry.brakeActive = brkLo != 0
+            appLogger.log("DECODE-E", "OBrK lo=\(brkLo) → brakeActive=\(telemetry.brakeActive) (prev=\(prevBrakeE))")
 
         case 0x03E8:
             // Heartbeat/enable frame — no telemetry fields decoded here.
