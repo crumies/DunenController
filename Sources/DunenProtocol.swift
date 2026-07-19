@@ -100,11 +100,12 @@ enum DunenProtocol {
 
         // Modbus read response: 01 03 byteCount <register bytes> CRClo CRChi
         // DUNEN function-code table: each 32-bit parameter = 2 × 16-bit Modbus registers.
-        // Tuning parameters are plain integers (0/1 toggle, small unsigned values).
-        // Decode as plain U32: value = (HIGH << 16) | LOW, then round to nearest integer.
-        // We check both HIGH and LOW words — the toggle value (0 or 1) could be in either.
-        // If HIGH==0 take LOW directly; if LOW==0 and HIGH is a small integer take HIGH.
-        // This handles both storage layouts seen in DUNEN firmware.
+        // Tuning toggle parameters (0/1) are stored as U32 integers:
+        //   HIGH word = upper 16 bits, LOW word = lower 16 bits.
+        // For small integers (0/1/2): full U32 = (HIGH<<16)|LOW is usually the value.
+        // If HIGH==0 and LOW is small → value is LOW (normal U32 storage).
+        // If LOW==0 and HIGH is small (≤10) → value is HIGH (IQ16 integer part in HIGH position).
+        // Both 0 → value is 0 (disabled / off).
         if b[0] == 0x01 && b[1] == 0x03 {
             let byteCount = Int(b[2])
             guard b.count >= 3 + byteCount else { return [:] }
@@ -117,14 +118,16 @@ enum DunenProtocol {
                 guard offset + 3 < b.count else { break }
                 let highWord = Int(UInt16(b[offset]) << 8 | UInt16(b[offset + 1]))
                 let lowWord  = Int(UInt16(b[offset + 2]) << 8 | UInt16(b[offset + 3]))
-                // Prefer LOW word if it holds the value; fall back to HIGH word.
-                // Both 0 → value is 0. HIGH non-zero and LOW zero → value is in HIGH.
+                // Resolve value: prefer non-zero LOW word; fall back to HIGH if LOW is 0 and
+                // HIGH is a small integer (≤ 100). If both 0, value = 0.
                 let value: Double
                 if lowWord != 0 {
                     value = Double(lowWord)
-                } else if highWord != 0 {
+                } else if highWord != 0 && highWord <= 100 {
+                    // HIGH word is the integer part stored in IQ16 HIGH position (some params)
                     value = Double(highWord)
                 } else {
+                    // Both 0 OR HIGH > 100 (noise/fraction): value = 0
                     value = 0
                 }
                 let address = start + i * 2

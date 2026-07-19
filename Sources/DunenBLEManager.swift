@@ -442,32 +442,24 @@ final class DunenBLEManager: NSObject, ObservableObject {
         appLogger.log("GEAR", "gearIn=\(telemetry.gearInputRaw) gearOut=\(telemetry.gearRaw) spdMod=\(telemetry.speedModeRaw) → mode=\(telemetry.mode.rawValue)")
     }
 
-    // Output-table poll addresses (Modbus address = (rowNo - 2) * 2).
-    // Each block kept small (≤ 20 words = 40 data bytes) to fit one BLE notification.
-    // Block A: addr 608 (row 306) count=16 → OStMode,OErrCode,OWarnCode,OGearIn,OGear,OACC
-    // Block B: addr 666 (row 335) count=4  → OMotTmp(335), OMosTmp(336)
-    // Block C: addr 682 (row 343) count=6  → OVkey(343), OVMon5V(344), OVMon15V(345)
     // Output-table poll blocks, rotated by outputPollTimer.
-    // Order: C first so voltage decimals (OVkey) arrive in ~0.5s not ~2s.
-    // Addr formula: (rowNo-2)*2.
+    // Order: C first so voltage decimals (OVkey) arrive within ~0.5s of connect.
+    // Addr formula: (rowNo-2)*2. Word offset within block = (absAddr - blockStart).
     //
     // Block C: addr 682 (row 343) count=6 → OVkey(343), OVMon5V(344), OVMon15V(345)
     // Block A: addr 600 (row 303) count=22
-    //   Word offsets within block starting at 600:
-    //   0,1  → row 303 OXhFlag  (U32: non-zero = handbrake active)
-    //   2,3  → row 304 (unused)
-    //   4,5  → row 305 (unused)
-    //   6,7  → row 306 OStMode  (U32)
-    //   8,9  → row 307 OErrCode (U32, read LOW word=u16(9))
-    //   10,11 → row 308 OWarnCode (U32, read LOW word=u16(11))
-    //   12,13 → row 309 OGearIn  (U32: 0=Park, 2=Drive, 4=Reverse)
-    //   14,15 → row 310 OGear    (U32)
-    //   16,17 → row 311 OACC     (IQ16: throttle 0-1)
-    //   18,19 → row 312 OTorLimit
-    //   20,21 → row 313 ODeratingK
+    //   word 0,1  → row 303 (reg 600)  OXhFlag   (U32: non-zero = handbrake)
+    //   word 6,7  → row 306 (reg 606)  OStMode   (U32)
+    //   word 8,9  → row 307 (reg 608)  OErrCode  (U32, LOW=u16(9))
+    //   word 10,11→ row 308 (reg 610)  OWarnCode (U32, LOW=u16(11))
+    //   word 12,13→ row 309 (reg 612)  OGearIn   (0=Park, 2=Drive, 4=Rev)
+    //   word 14,15→ row 310 (reg 614)  OGear     (U32)
+    //   word 16,17→ row 311 (reg 616)  OACC ← NOTE: abs addr=(311-2)*2=618≠616. Use iq16At(18).
+    //   word 18,19→ row 311 (reg 618)  OACC      (IQ16: throttle 0-1) ← CORRECT offset
+    //   word 20,21→ row 312 (reg 620)  OTorLimit
     // Block B: addr 666 (row 335) count=4 → OMotTmp(335), OMosTmp(336)
-    // Block D: addr 708 (row 356) count=14 → OSpdMod(356) word 0,1; OVechSpd(362) word 12,13
-    // Block E: addr 576 (row 290) count=2  → OBrK brake signal
+    // Block D: addr 708 (row 356) count=14 → OSpdMod HIGH word=u16(0), OVechSpd words 12,13
+    // Block E: addr 576 (row 290) count=2  → OBrK brake signal (both words checked)
     private let outputPollConfigs: [(start: Int, count: Int)] = [
         (682,  6),   // C first: OVkey voltage arrives within 0.5s of connect
         (600, 22),   // A: OXhFlag(brake),OStMode,OErrCode,OWarnCode,OGearIn,OGear,OACC
@@ -726,8 +718,10 @@ final class DunenBLEManager: NSObject, ObservableObject {
             // Accept any valid byteCount > 0; the live frame is already caught above by isDunenLivePrimaryFrame.
             if bc > 0, let start = pendingReadStarts.first {
                 pendingReadStarts.removeFirst()
-                appLogger.log("PARSER", "tuning resp start=\(start) bc=\(bc) len=\(data.count)")
+                let rawHex2 = b2.map { String(format: "%02X", $0) }.joined(separator: " ")
+                appLogger.log("TUNING-RESP", "start=\(start) bc=\(bc) len=\(data.count) raw=\(rawHex2)")
                 let values = DunenProtocol.parseParameterValues(from: data, expectedStart: start)
+                appLogger.log("TUNING-PARSE", "parsed \(values.count) values: \(values.map { "addr\($0.key)=\($0.value)" }.joined(separator: " "))")
                 tuningStore?.applyReadValues(values)
                 return
             }
@@ -938,45 +932,54 @@ final class DunenBLEManager: NSObject, ObservableObject {
             return true
 
         case 600:
-            // Block A: addr 600 (row 303 OXhFlag) count=22
-            //  0,1  → row 303 OXhFlag   (U32: non-zero = handbrake)
-            //  6,7  → row 306 OStMode   (U32)
-            //  8,9  → row 307 OErrCode  (U32)
-            //  10,11 → row 308 OWarnCode (U32)
-            //  12,13 → row 309 OGearIn   (U32: 0=Empty, 1=D, 4=R)
-            //  14,15 → row 310 OGear     (U32)
-            //  16,17 → row 311 OACC      (IQ16 throttle 0-1)
-            guard regs.count >= 14 else {
-                appLogger.log("DECODE-WARN", "block-A reg=600 too few words=\(regs.count) expected≥14")
+            // Block A starts at Modbus address 600. Word formula: wordIdx = absAddr - 600.
+            // Row formula (DUNEN output table): absAddr = (row - 2) * 2.
+            // Confirmed anchor: OVkey row 343 → addr 682, works at word 0 in block-C. ✓
+            //
+            // Row 302 → addr (302-2)*2=600 → words  0, 1  (first pair — unused/reserved)
+            // Row 303 → addr (303-2)*2=602 → words  2, 3  OXhFlag   (U32: non-zero = brake)
+            // Row 304 → addr (304-2)*2=604 → words  4, 5  (unused)
+            // Row 305 → addr (305-2)*2=606 → words  6, 7  (unused)
+            // Row 306 → addr (306-2)*2=608 → words  8, 9  OStMode   (U32)
+            // Row 307 → addr (307-2)*2=610 → words 10,11  OErrCode  (U32, LOW=u16(11))
+            // Row 308 → addr (308-2)*2=612 → words 12,13  OWarnCode (U32, LOW=u16(13))
+            // Row 309 → addr (309-2)*2=614 → words 14,15  OGearIn   (0=Park, 2=Drive, 4=Rev)
+            // Row 310 → addr (310-2)*2=616 → words 16,17  OGear     (U32)
+            // Row 311 → addr (311-2)*2=618 → words 18,19  OACC      (IQ16: throttle 0-1)
+            // Row 312 → addr (312-2)*2=620 → words 20,21  OTorLimit
+            guard regs.count >= 16 else {
+                appLogger.log("DECODE-WARN", "block-A reg=600 too few words=\(regs.count) expected≥16")
                 break
             }
 
-            // OXhFlag (row 303): handbrake signal at words 0,1.
-            // Non-zero = brake lever pressed. Set brakeActive; only clear if BOTH words are zero.
-            let xhHi = u16(0); let xhLo = u16(1)
+            // OXhFlag (row 303 → addr 602 → words 2,3): handbrake. Non-zero = brake pressed.
+            let xhHi = u16(2); let xhLo = u16(3)
             let prevBrake = telemetry.brakeActive
             telemetry.brakeActive = (xhHi | xhLo) != 0
             appLogger.log("DECODE-A", "OXhFlag hi=\(xhHi) lo=\(xhLo) → brakeActive=\(telemetry.brakeActive) (prev=\(prevBrake))")
 
-            // OErrCode (row 307, words 8,9): value is in LOW word only.
-            // Always update (including 0 = clear) so stale errors are removed.
-            let outErr  = u16(9)    // LOW word of OErrCode
-            let outWarn = u16(11)   // LOW word of OWarnCode
+            // OErrCode (row 307 → addr 610 → words 10,11): LOW word = error code.
+            let outErr  = u16(11)   // LOW word of OErrCode  (word 11)
+            let outWarn = u16(13)   // LOW word of OWarnCode (word 13)
             telemetry.errorCode  = outErr
             telemetry.warningCode = outWarn
 
-            // OGearIn: value is a small integer (0,1,2,4). Read both HIGH and LOW words;
-            // use whichever is non-zero and small. Logs show which word the firmware uses.
-            let gearHi = u16(12); let gearLo = u16(13)
+            // OGearIn (row 309 → addr 614 → words 14,15): 0=Park, 2=Drive, 4=Reverse.
+            // Check both words; use whichever is non-zero.
+            let gearHi = u16(14); let gearLo = u16(15)
             let gearIn = gearLo != 0 ? gearLo : gearHi
-            let gearOut = u16(15)   // OGear LOW word
+            // OGear (row 310 → addr 616 → words 16,17): LOW word = gear output.
+            let gearOut = u16(17)
             telemetry.gearInputRaw = gearIn
             telemetry.gearRaw      = gearOut
             appLogger.log("DECODE-A", "OGearIn hi=\(gearHi) lo=\(gearLo) → gearIn=\(gearIn) | OGear lo=\(gearOut)")
 
-            let acc = iq16At(16)
-            if acc >= 0 && acc <= 1.5 { telemetry.throttleOpen = min(1.0, max(0.0, acc)) }
-            appLogger.log("DECODE-A", "OACC raw=\(String(format:"%.4f",acc)) → throttle=\(String(format:"%.1f",telemetry.throttleOpen*100))%")
+            // OACC (row 311 → addr 618 → words 18,19): IQ16 throttle position 0.0–1.0.
+            if regs.count >= 20 {
+                let acc = iq16At(18)
+                if acc >= 0 && acc <= 1.5 { telemetry.throttleOpen = min(1.0, max(0.0, acc)) }
+                appLogger.log("DECODE-A", "OACC raw=\(String(format:"%.4f",acc)) → throttle=\(String(format:"%.1f",telemetry.throttleOpen*100))%")
+            }
 
             resolveGearAndRideMode()
 
@@ -1031,13 +1034,15 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         case 708:
             // Output table Block D: addr 708 (row 356), count=14
-            //  0,1  → row 356 OSpdMod  (U32: 0=ECO, 1=XC, 2=SPORTS) — LOW word
+            //  0,1  → row 356 OSpdMod  (U32: 0=ECO, 1=XC, 2=SPORTS)
             //  12,13 → row 362 OVechSpd (IQ16) → vehicle speed km/h
             //  (addr 720 = row 362; offset from block start = (720-708)/2 = 6 pairs = word 12,13)
             guard regs.count >= 2 else { break }
 
-            // OSpdMod: small U32. Value is in LOW word (u16(1)). HIGH word (u16(0)) is IQ16 frac.
-            let spdMod = u16(1)   // LOW word = integer value (0=ECO,1=XC,2=SPORTS)
+            // OSpdMod: confirmed from logs that r708=value, r709=0.
+            // Value is in HIGH word (u16(0)). LOW word (u16(1)) is always 0.
+            // Previous code used u16(1) (always 0 → always ECO). Fix: use u16(0).
+            let spdMod = u16(0)   // HIGH word = mode value (0=ECO, 1=XC, 2=SPORTS)
             telemetry.speedModeRaw = spdMod
             appLogger.log("DECODE-D", "OSpdMod hi=\(u16(0)) lo=\(u16(1)) → spdMod=\(spdMod) currentMode=\(telemetry.mode.rawValue)")
 
@@ -1056,12 +1061,17 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         case 576:
             // Block E: OBrK (row 290) brake signal. addr=(290-2)*2=576, count=2 → words 0,1.
-            // OBrK is a U32; non-zero LOW word (u16(1)) = brake pressed.
+            // OBrK is a U32; non-zero in EITHER word = brake pressed.
+            // Previous code only checked LOW word (u16(1)) — may miss HIGH-word encoding.
             guard regs.count >= 2 else { break }
+            let brkHi = u16(0)   // HIGH word of OBrK
             let brkLo = u16(1)   // LOW word of OBrK
             let prevBrakeE = telemetry.brakeActive
-            telemetry.brakeActive = brkLo != 0
-            appLogger.log("DECODE-E", "OBrK lo=\(brkLo) → brakeActive=\(telemetry.brakeActive) (prev=\(prevBrakeE))")
+            // Only update from block E if OXhFlag (block A) is not already showing brake active,
+            // so a sluggish block-E poll doesn't clear a live brakeActive from block A.
+            let brkActive = (brkHi | brkLo) != 0
+            if brkActive { telemetry.brakeActive = true }
+            appLogger.log("DECODE-E", "OBrK hi=\(brkHi) lo=\(brkLo) → brakeActive=\(telemetry.brakeActive) (prev=\(prevBrakeE))")
 
         case 0x03E8:
             // Heartbeat/enable frame — no telemetry fields decoded here.
