@@ -298,15 +298,14 @@ final class DunenBLEManager: NSObject, ObservableObject {
         }
         pollTimer?.fire()
 
-        // Slower timer: rotates through 4 output-table blocks at 0.5s each.
-        // Order: C first (voltage), then A (gear/brake), B (temps), D (speed mode).
-        // This ensures OVkey voltage decimals arrive within the first 0.5s.
-        outputPollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        // Slower timer: rotates through output-table blocks. Brake (E) and gear/mode (A)
+        // appear twice per rotation for ~0.4s worst-case latency on those critical signals.
+        outputPollTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             guard let self else { return }
             DispatchQueue.main.async { self.requestOutputBlock() }
         }
         outputPollTimer?.fire()
-        appLogger.log("POLL", "Started live=0.35s outputBlock=0.5s rotation=C,A,B,D")
+        appLogger.log("POLL", "Started live=0.35s outputBlock=0.2s rotation=E,A,C,E,A,B,D,C")
     }
 
     private var didSendDunenTypeReads: Bool = false
@@ -460,12 +459,18 @@ final class DunenBLEManager: NSObject, ObservableObject {
     // Block B: addr 666 (row 335) count=4 → OMotTmp(335), OMosTmp(336)
     // Block D: addr 708 (row 356) count=14 → OSpdMod HIGH word=u16(0), OVechSpd words 12,13
     // Block E: addr 576 (row 290) count=2  → OBrK brake signal (both words checked)
+    // Poll rotation: brake (E=576) and gear/mode (A=600) appear every other slot so they
+    // update in ~0.4s worst case. Voltage (C=682) and temps (B=666) are less time-critical.
+    // Timer fires at 0.2s → full rotation = 0.2 × 8 = 1.6s for slow blocks, ~0.4s for fast.
     private let outputPollConfigs: [(start: Int, count: Int)] = [
-        (682,  6),   // C first: OVkey voltage arrives within 0.5s of connect
-        (600, 22),   // A: OXhFlag(brake),OStMode,OErrCode,OWarnCode,OGearIn,OGear,OACC
+        (576,  2),   // E: OBrK brake — fast slot 1
+        (600, 22),   // A: OGearIn / OXhFlag — fast slot 2
+        (682,  6),   // C: OVkey voltage
+        (576,  2),   // E: OBrK brake — fast slot 4 (repeated)
+        (600, 22),   // A: OGearIn / OXhFlag — fast slot 5 (repeated)
         (666,  4),   // B: OMotTmp,OMosTmp
         (708, 14),   // D: OSpdMod + OVechSpd
-        (576,  2),   // E: OBrK brake signal (row 290 → addr (290-2)*2=576)
+        (682,  6),   // C: OVkey voltage (repeated to keep decimals fresh)
     ]
     private var outputPollIdx = 0
 
@@ -871,13 +876,12 @@ final class DunenBLEManager: NSObject, ObservableObject {
             }
 
             // RPM: ActualSpeed IQ16 words 4(frac),5(int). Signed — negative in reverse.
-            // Only update rpm and wheelRPM here. speedKmh comes from OVechSpd (block D) which
-            // is the controller's own calibrated speed — accurate and stable.
+            // Dead-band of 3 RPM filters idle rotor oscillation noise so it reads 0 when stopped.
             let motorRPMRaw = iq16At(4)
             let motorRPM = abs(motorRPMRaw)
             let prevRPM = telemetry.rpm
-            telemetry.rpm = motorRPM >= 0.5 ? Int(motorRPM) : 0
-            telemetry.wheelRPM = motorRPM > 0 ? motorRPM / finalDriveRatio : 0
+            telemetry.rpm = motorRPM >= 3.0 ? Int(motorRPM) : 0
+            telemetry.wheelRPM = telemetry.rpm > 0 ? Double(telemetry.rpm) / finalDriveRatio : 0
             appLogger.log("DECODE-LIVE", "RPM raw=\(String(format:"%.4f",motorRPMRaw)) → \(telemetry.rpm) (prev=\(prevRPM))")
 
             // Controller temp: MosTmp IQ16 words 6(frac),7(int).
@@ -912,14 +916,20 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.regenLevel = 0
             }
 
-            // Motor angle: word 18 = raw u16 rotor position counter.
-            // Use raw value directly — the zero-angle subtraction produced incorrect lean output.
+            // Motor angle: word 18 = raw u16 encoder position (0–65535, full 360°).
+            // Zero angle: word 20 = encoder value at upright/calibration point.
+            // Lean = signed difference from zero, scaled to degrees.
+            // 65536 counts = 360°, so 1 count = 360/65536 ≈ 0.00549°.
+            // Clamp display to ±42° (reasonable lean limit for a motorcycle/e-moto).
             let rawMotor = u16(18)
+            let zero = u16(20)
             lastRawMotorCount = rawMotor
             telemetry.motorAngle = rawMotor
-            let zero = u16(20)
             telemetry.zeroAngle = zero
-            telemetry.leanAngle = Double(rawMotor)
+            // Signed wrap-around subtraction so the value crosses zero cleanly.
+            let rawDiff = Int(Int16(bitPattern: UInt16((rawMotor &- zero) & 0xFFFF)))
+            let degrees = Double(rawDiff) * 360.0 / 65536.0
+            telemetry.leanAngle = max(-42.0, min(42.0, degrees))
 
             // Only update history on the live frame — output blocks don't change RPM/speed
             // so appending on every block would flood the graph with flat segments.
@@ -965,9 +975,10 @@ final class DunenBLEManager: NSObject, ObservableObject {
             telemetry.warningCode = outWarn
 
             // OGearIn (row 309 → addr 614 → words 14,15): 0=Park, 2=Drive, 4=Reverse.
-            // Check both words; use whichever is non-zero.
+            // Always use the LOW word (u16(15)) — 0 is a valid value meaning Park.
+            // The old "use HIGH if LOW==0" logic prevented Park from ever being detected.
             let gearHi = u16(14); let gearLo = u16(15)
-            let gearIn = gearLo != 0 ? gearLo : gearHi
+            let gearIn = gearLo
             // OGear (row 310 → addr 616 → words 16,17): LOW word = gear output.
             let gearOut = u16(17)
             telemetry.gearInputRaw = gearIn
@@ -1046,13 +1057,17 @@ final class DunenBLEManager: NSObject, ObservableObject {
             telemetry.speedModeRaw = spdMod
             appLogger.log("DECODE-D", "OSpdMod hi=\(u16(0)) lo=\(u16(1)) → spdMod=\(spdMod) currentMode=\(telemetry.mode.rawValue)")
 
-            // OVechSpd: IQ16 vehicle speed in km/h at words 12(frac),13(int).
-            // Use as primary speed when available — more accurate than RPM-derived estimate.
+            // OVechSpd: IQ16 motor RPM at words 12(frac),13(int).
+            // This is motor RPM (same units as ActualSpeed in live frame), not km/h directly.
+            // Convert to km/h using the bike's gearing: kmhPerMotorRPM = circumference/ratio.
+            // Dead-band of 3 RPM matches the live frame threshold so both zero together.
             if regs.count >= 14 {
-                let vechSpd = iq16At(12)
-                if vechSpd >= 0 && vechSpd < 300 {
-                    telemetry.speedKmh = (vechSpd * 10.0).rounded() / 10.0
-                    appLogger.log("DECODE-D", "OVechSpd raw=\(String(format:"%.4f",vechSpd)) → \(String(format:"%.1f",telemetry.speedKmh))km/h")
+                let vechRPMRaw = iq16At(12)
+                let vechRPM = abs(vechRPMRaw)
+                if vechRPM < 20000 {
+                    let kmh = vechRPM >= 3.0 ? (vechRPM * kmhPerMotorRPM * 10.0).rounded() / 10.0 : 0.0
+                    telemetry.speedKmh = kmh
+                    appLogger.log("DECODE-D", "OVechSpd raw=\(String(format:"%.4f",vechRPMRaw)) RPM → \(String(format:"%.1f",kmh))km/h (ratio=\(String(format:"%.5f",kmhPerMotorRPM)))")
                 }
             }
 
