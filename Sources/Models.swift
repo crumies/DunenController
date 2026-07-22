@@ -108,6 +108,7 @@ final class AppSettings: ObservableObject {
     @AppStorage("hudShowBatteryCard") var hudShowBatteryCard: Bool = false
     @AppStorage("hudShowDiagnosticsCard") var hudShowDiagnosticsCard: Bool = false
     @AppStorage("hudShowLeanCard") var hudShowLeanCard: Bool = false
+    @AppStorage("hudShowGPSSpeed") var hudShowGPSSpeed: Bool = false
     @AppStorage("demoAutoInput") var demoAutoInput: Bool = true
 
     var speedUnit: SpeedUnit {

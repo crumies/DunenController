@@ -8,6 +8,7 @@ struct AptumDashboardApp: App {
     @StateObject private var ble = DunenBLEManager()
     @StateObject private var tuning = TuningStore()
     @StateObject private var settings = AppSettings()
+    @StateObject private var gps = GPSSpeedManager()
 
     var body: some Scene {
         WindowGroup {
@@ -15,6 +16,7 @@ struct AptumDashboardApp: App {
                 .environmentObject(ble)
                 .environmentObject(tuning)
                 .environmentObject(settings)
+                .environmentObject(gps)
                 .preferredColorScheme(settings.colorScheme)
                 .onAppear {
                     if settings.hapticsEnabled { UIImpactFeedbackGenerator(style: .soft).impactOccurred() }

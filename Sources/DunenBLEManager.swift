@@ -363,24 +363,10 @@ final class DunenBLEManager: NSObject, ObservableObject {
     private func isDunenLivePrimaryFrame(_ data: Data) -> Bool {
         let b = [UInt8](data)
         // 0x0400 live frame: byteCount=0x30 (24 words = 48 data bytes), total ~53 bytes.
-        // Start 0x0400 = reg 1024. byteCount must be exactly 0x30.
-        // Allow b.count >= 51 (3 header + 48 data; CRC bytes may be absent on some BLE stacks).
-        guard b.count >= 51, b[0] == 0x01, b[1] == 0x03, b[2] == 0x30 else { return false }
-
-        func u16(_ index: Int) -> Int {
-            let o = 3 + index * 2
-            guard o + 1 < b.count else { return 0 }
-            return Int(UInt16(b[o]) << 8 | UInt16(b[o + 1]))
-        }
-
-        func fixed(_ frac: Int, _ whole: Int) -> Double {
-            Double(Int16(bitPattern: UInt16(u16(whole)))) + Double(u16(frac)) / 65536.0
-        }
-
-        // Voltage at words 2(frac),3(int) — Udc in 0x0400 frame layout.
-        // Must be in valid e-bike range (45–95V).
-        let voltage = fixed(2, 3)
-        return voltage >= 45 && voltage <= 95
+        // Identified purely by shape: len≥51, func=0x03, byteCount=0x30.
+        // Do NOT gate on voltage — at boot the voltage seed may be 0 and we still need to
+        // decode the frame so isInitializing clears and voltage gets populated.
+        return b.count >= 51 && b[0] == 0x01 && b[1] == 0x03 && b[2] == 0x30
     }
 
     private func looksLikeBogusPatternPage(_ regs: [Int]) -> Bool {
@@ -909,17 +895,15 @@ final class DunenBLEManager: NSObject, ObservableObject {
             telemetry.errorCode  = outErr
             telemetry.warningCode = outWarn
 
-            // OGearIn (row 309 → addr 614 → words 14,15): 0=Park, 2=Drive, 4=Reverse.
-            // Log confirms value is in HIGH word (r614): hi=2=Drive, hi=0=Park, hi=4=Rev.
-            // LOW word (r615) is always 0. Use HIGH word.
-            let gearHi = u16(14); let gearLo = u16(15)
-            let gearIn = gearHi
-            // OGear (row 310 → addr 616 → words 16,17): LOW word = gear output.
-            let gearOut = u16(17)
-            telemetry.gearInputRaw = gearIn
+            // OGear (row 310 → addr 616 → words 16,17): HIGH word = gear. 0=Park, 2=Drive, 4=Rev.
+            // User confirmed OGear (not OGearIn) correctly goes 0/2/4.
+            // OGearIn (r614) never goes to 0 — stays at 2 or 4. Use OGear HIGH word instead.
+            let gearHi = u16(16)   // HIGH word of OGear (row 310)
+            let gearOut = u16(17)  // LOW word of OGear
+            telemetry.gearInputRaw = gearHi
             telemetry.gearRaw      = gearOut
-            didReceiveGearData = true   // block A is authoritative source for gear
-            appLogger.log("DECODE-A", "OGearIn hi=\(gearHi) lo=\(gearLo) → gearIn=\(gearIn) | OGear lo=\(gearOut)")
+            didReceiveGearData = true
+            appLogger.log("DECODE-A", "OGear hi=\(gearHi) lo=\(gearOut) → gearIn=\(gearHi)")
 
             // OACC (row 311 → addr 618 → words 18,19): IQ16 throttle position 0.0–1.0.
             if regs.count >= 20 {
@@ -1319,12 +1303,14 @@ private func reg32s(_ regs: [Int], idx: Int) -> Double {
 /// Breakpoints calibrated to real LG cell discharge curve; 74V = ~49%.
 /// Full = 84V (4.2V×20) = 100%, empty = 60V (3.0V×20) = 0%.
 private func liIonSoc20s(_ voltage: Double) -> Double {
-    // (voltage, soc%) breakpoints calibrated to official DunenConfiger app.
-    // Confirmed: 79.36V = 77%, 74V = 48%.
+    // (voltage, soc%) breakpoints calibrated to real bike BMS readings.
+    // Confirmed: 81.53V = ~98%, 79.36V = 77%, 74V = 48%.
+    // Top anchor shifted: full charge = 84V = 100%, 82V ≈ 98% (was 93% — too low).
     let curve: [(v: Double, soc: Double)] = [
         (84.0, 100.0),
-        (82.0,  93.0),
-        (80.5,  85.0),
+        (82.0,  98.0),  // ← recalibrated: 81.53V was showing 91%, should be ~98%
+        (81.0,  92.0),
+        (80.5,  88.0),
         (79.36, 77.0),  // ← confirmed: official app shows 77% at 79.36V
         (79.0,  75.0),
         (77.5,  65.0),

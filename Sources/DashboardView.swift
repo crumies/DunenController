@@ -27,6 +27,10 @@ struct DashboardView: View {
                     BatteryHealthCard()
                 }
 
+                if settings.hudShowGPSSpeed {
+                    GPSSpeedCard()
+                }
+
                 if settings.hudShowLeanCard {
                     LeanCard()
                 }
@@ -655,6 +659,11 @@ struct FullscreenHUD: View {
                             .frame(maxWidth: 430)
                     }
 
+                    if settings.hudShowGPSSpeed {
+                        GPSSpeedCard()
+                            .frame(maxWidth: 430)
+                    }
+
                     if settings.hudShowLeanCard {
                         LeanCard()
                             .frame(maxWidth: 430)
@@ -722,6 +731,7 @@ struct HUDAddMenu: View {
             Toggle("Battery card", isOn: $settings.hudShowBatteryCard)
             Toggle("Ride recording", isOn: $settings.hudShowRideRecording)
             Toggle("Mini diagnostics", isOn: $settings.hudShowDiagnosticsCard)
+            Toggle("GPS Speed", isOn: $settings.hudShowGPSSpeed)
             Divider()
             Toggle("kW readout", isOn: $settings.hudShowKW)
             Toggle("Temperatures", isOn: $settings.hudShowTemps)
@@ -736,6 +746,71 @@ struct HUDAddMenu: View {
                 .overlay(Circle().stroke(.cyan.opacity(0.35), lineWidth: 1))
                 .clipShape(Circle())
                 .shadow(color: .cyan.opacity(0.25), radius: 14)
+        }
+    }
+}
+
+// MARK: - GPS Speed Card
+
+struct GPSSpeedCard: View {
+    @EnvironmentObject var gps: GPSSpeedManager
+    @EnvironmentObject var settings: AppSettings
+
+    private var speedValue: Double {
+        settings.speedUnit == .kmh ? gps.speedKmh : gps.speedKmh * 0.621371
+    }
+
+    var body: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Image(systemName: "location.fill")
+                        .foregroundStyle(.cyan)
+                    Text("GPS Speed")
+                        .font(.headline)
+                    Spacer()
+                    Circle()
+                        .fill(gps.isActive ? Color.green : Color.secondary.opacity(0.4))
+                        .frame(width: 8, height: 8)
+                }
+
+                HStack(alignment: .lastTextBaseline, spacing: 6) {
+                    Text(gps.isActive ? String(format: "%.1f", speedValue) : "—")
+                        .font(.system(size: 48, weight: .heavy, design: .rounded))
+                        .foregroundStyle(.cyan)
+                    Text(settings.speedUnit.rawValue)
+                        .font(.headline.weight(.bold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+
+                HStack {
+                    switch gps.authStatus {
+                    case .notDetermined:
+                        Button("Enable GPS") { gps.start() }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.cyan)
+                            .font(.caption.weight(.semibold))
+                    case .denied, .restricted:
+                        Label("Location access denied — enable in Settings", systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    default:
+                        if gps.isActive {
+                            Button("Stop GPS") { gps.stop() }
+                                .buttonStyle(.bordered)
+                                .tint(.secondary)
+                                .font(.caption.weight(.semibold))
+                        } else {
+                            Button("Start GPS") { gps.start() }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.cyan)
+                                .font(.caption.weight(.semibold))
+                        }
+                    }
+                    Spacer()
+                }
+            }
         }
     }
 }
