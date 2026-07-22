@@ -41,9 +41,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
     private var pollFrames: [(start: Int, data: Data)] = []
     private var pollIndex: Int = 0
     private var pendingReadStarts: [Int] = []
-    private var inFlightReadStart: Int?        // for 0x0400 live frame only
-    private var inFlightSentAt: Date?
-    private var outInFlightStart: Int?          // for output register block polls
+    private var outInFlightStart: Int?          // kept for stopPollTimer reset only
     private var outInFlightSentAt: Date?
     private var lastDecodedStart: Int?
     private var bootScanDone: Bool = false
@@ -54,9 +52,9 @@ final class DunenBLEManager: NSObject, ObservableObject {
     private var didReceiveGearData: Bool = false   // true once block A (608) delivered valid gear
     private var modeStaticReadStep: Int = 0
     private var lastModeStaticReadAt: Date?
-    private var liveProbeTick: Int = 0
     private var lastSpeedKmh: Double = 0
     private var lastVoltage: Double = 0
+    private var brakeLastActiveAt: Date?     // latch: don't clear brake for 200ms after last active signal
     private var zeroToFiftyRunning = false
     private var zeroToFiftyStart: Date?
     private var pollTimer: Timer?
@@ -274,8 +272,6 @@ final class DunenBLEManager: NSObject, ObservableObject {
     private func startPollTimer() {
         stopPollTimer()
         pendingReadStarts.removeAll()
-        inFlightReadStart = nil
-        inFlightSentAt = nil
         outInFlightStart = nil
         outInFlightSentAt = nil
         lastDecodedStart = nil
@@ -284,28 +280,35 @@ final class DunenBLEManager: NSObject, ObservableObject {
         didSendDunenTypeReads = false
         lastLiveNotifyAt = nil
         pollIndex = 0
-        liveProbeTick = 0
         outputPollIdx = 0
         didReceiveGearData = false
         isInitializing = true
-
         pollFrames = []
 
-        // Fast timer: Table-2 live frame at 0x0400 (reg 1024), count=24.
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
+        // Send the live-enable command once — the controller will push 0x0400 frames
+        // automatically via notify at ~300ms. We do NOT poll for it; we just receive it.
+        // A watchdog in the timer re-sends the enable if frames stop arriving.
+        sendDunenTypeAndDefaultReadsIfNeeded()
+        sendDunenLiveEnableIfNeeded()
+
+        // Single timer at 100ms: blast all 5 output blocks every tick.
+        // Each block has a unique byteCount so responses self-route in addPacket.
+        // The controller can respond to all 5 in ~350ms total (5 × ~60ms round-trip)
+        // which fits comfortably inside the 100ms * 5 = 500ms window.
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.10, repeats: true) { [weak self] _ in
             guard let self else { return }
-            DispatchQueue.main.async { self.requestLiveOutput() }
+            DispatchQueue.main.async {
+                // Watchdog: re-enable live stream if it goes quiet
+                if let last = self.lastLiveNotifyAt, Date().timeIntervalSince(last) > 2.5 {
+                    self.appLogger.log("POLL", "No live notify for >2.5s — re-enabling")
+                    self.didSendLiveEnable = false
+                    self.sendDunenLiveEnableIfNeeded(force: true)
+                }
+                self.requestAllOutputBlocks()
+            }
         }
         pollTimer?.fire()
-
-        // Slower timer: rotates through output-table blocks. Brake (E) and gear/mode (A)
-        // appear twice per rotation for ~0.4s worst-case latency on those critical signals.
-        outputPollTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            DispatchQueue.main.async { self.requestOutputBlock() }
-        }
-        outputPollTimer?.fire()
-        appLogger.log("POLL", "Started live=0.35s outputBlock=0.2s rotation=E,A,C,E,A,B,D,C")
+        appLogger.log("POLL", "Started outputBlocks=0.10s push-notify for live 0x0400")
     }
 
     private var didSendDunenTypeReads: Bool = false
@@ -486,63 +489,29 @@ final class DunenBLEManager: NSObject, ObservableObject {
     ///  12–17 → other live params
     ///  18   → motor angle (u16, raw)
     ///  20   → zero angle (u16, raw)
-    private func requestLiveOutput() {
+
+    /// Fire all output register blocks at once, staggered 10ms apart.
+    /// Each block has a unique byteCount so responses self-route without an in-flight tracker.
+    /// E(576)→bc=4, A(600)→bc=44, C(682)→bc=12, B(666)→bc=8, D(708)→bc=28 — all unique.
+    private func requestAllOutputBlocks() {
         guard isConnected, let p = connectedPeripheral else { return }
-
-        sendDunenTypeAndDefaultReadsIfNeeded()
-        sendDunenLiveEnableIfNeeded()
-
-        if let last = lastLiveNotifyAt, Date().timeIntervalSince(last) > 2.5 {
-            appLogger.log("POLL", "No live notify for >2.5s, re-enabling")
-            didSendLiveEnable = false
-            sendDunenLiveEnableIfNeeded(force: true)
-        }
-
-        if let start = inFlightReadStart {
-            let age = Date().timeIntervalSince(inFlightSentAt ?? Date())
-            if age < 0.5 { return }
-            appLogger.log("POLL-TIMEOUT", "Dropping live in-flight 0x\(String(start, radix: 16))")
-            inFlightReadStart = nil
-            inFlightSentAt = nil
-        }
-
-        // Table-2 live frame: start at 0x0400 (reg 1024), count=24 words
-        // byteCount response = 48 bytes = 0x30
-        let frame = DunenProtocol.modbusReadFrame(start: 0x0400, count: 24)
-        inFlightReadStart = 0x0400
-        inFlightSentAt = Date()
-        developerStatus = "Live 0x0400"
         let target = notifyCharacteristic ?? secondaryWriteCharacteristic ?? writeCharacteristic
-        sendReadOnlyFrame(frame, via: target, peripheral: p, note: "live Table2 start=0x0400")
-        liveProbeTick += 1
-    }
-
-    /// Slower output register block poll — uses its own in-flight tracker.
-    private func requestOutputBlock() {
-        guard isConnected, let p = connectedPeripheral else { return }
-
-        if let start = outInFlightStart {
-            let age = Date().timeIntervalSince(outInFlightSentAt ?? Date())
-            if age < 0.45 {
-                // Previous request still within window — don't pile up
-                return
-            }
-            if age >= 0.45 {
-                appLogger.log("OUT-POLL-TIMEOUT", "reg=\(start) no response after \(String(format:"%.2f",age))s — advancing")
-                outInFlightStart = nil
-                outInFlightSentAt = nil
+        // Unique byteCount configs — no rotation needed, fire them all.
+        let configs: [(start: Int, count: Int)] = [
+            (576,  2),   // E: OBrK brake          → bc=4
+            (600, 22),   // A: OGearIn/OXhFlag/OACC → bc=44
+            (682,  6),   // C: OVkey voltage        → bc=12
+            (666,  4),   // B: temps                → bc=8
+            (708, 14),   // D: OSpdMod + OVechSpd   → bc=28
+        ]
+        for (idx, cfg) in configs.enumerated() {
+            let frame = DunenProtocol.modbusReadFrame(start: cfg.start, count: cfg.count)
+            let delay = Double(idx) * 0.010   // 10ms stagger between each write
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak p] in
+                guard let self, let p else { return }
+                self.sendReadOnlyFrame(frame, via: target, peripheral: p, note: "out-block addr=\(cfg.start)")
             }
         }
-
-        let cfg = outputPollConfigs[outputPollIdx % outputPollConfigs.count]
-        outputPollIdx += 1
-        let frame = DunenProtocol.modbusReadFrame(start: cfg.start, count: cfg.count)
-        outInFlightStart = cfg.start
-        outInFlightSentAt = Date()
-        let expectedBC = cfg.count * 2
-        appLogger.log("OUT-POLL", "TX reg=\(cfg.start) count=\(cfg.count) expectedByteCount=\(expectedBC) [0x\(String(format:"%02X",expectedBC))]")
-        let target = notifyCharacteristic ?? secondaryWriteCharacteristic ?? writeCharacteristic
-        sendReadOnlyFrame(frame, via: target, peripheral: p, note: "output-block addr=\(cfg.start)")
     }
 
     /// Send a one-shot Modbus read for any register range. Result shows in probeResult.
@@ -697,73 +666,35 @@ final class DunenBLEManager: NSObject, ObservableObject {
 
         let isModbusRead = data.count >= 3 && data[0] == 0x01 && data[1] == 0x03
 
-        // Primary live frame: Table-2 from 0x0400 (byteCount=0x30) — pass shape check.
+        // Live frame pushed by controller via notify — just receive and decode it.
         if isDunenLivePrimaryFrame(data) {
             lastLiveNotifyAt = Date()
-            inFlightReadStart = nil
-            inFlightSentAt = nil
-            appLogger.log("PARSER", "live 0x0400 len=\(data.count)")
             _ = decodeDunenPage(data, expectedStart: 0x0400)
             return
         }
 
-        guard isModbusRead else {
-            decodeGenericFrame(data)
-            return
-        }
+        guard isModbusRead else { decodeGenericFrame(data); return }
 
-        // Tuning reads are sent via writeCharacteristic (FFF2) while live polls go via
-        // notifyCharacteristic. Both responses arrive here. Check tuning FIRST so a pending
-        // tuning response isn't consumed as a live-poll response.
-        // Tuning reads now use exact counts (count=2 or count=4) → byteCount=4 or 8,
-        // which can NEVER match the live frame byteCount=0x30. Accept any byteCount here.
+        // Tuning read responses — check pending queue first.
         if !pendingReadStarts.isEmpty {
             let b2 = [UInt8](data)
             let bc = b2.count >= 3 ? Int(b2[2]) : 0
-            // Accept any valid byteCount > 0; the live frame is already caught above by isDunenLivePrimaryFrame.
             if bc > 0, let start = pendingReadStarts.first {
                 pendingReadStarts.removeFirst()
-                let rawHex2 = b2.map { String(format: "%02X", $0) }.joined(separator: " ")
-                appLogger.log("TUNING-RESP", "start=\(start) bc=\(bc) len=\(data.count) raw=\(rawHex2)")
+                appLogger.log("TUNING-RESP", "start=\(start) bc=\(bc) len=\(data.count)")
                 let values = DunenProtocol.parseParameterValues(from: data, expectedStart: start)
-                appLogger.log("TUNING-PARSE", "parsed \(values.count) values: \(values.map { "addr\($0.key)=\($0.value)" }.joined(separator: " "))")
                 tuningStore?.applyReadValues(values)
                 return
             }
         }
 
-        // Route the response to whoever sent the request.
-        // If a wrong-size packet arrives while inFlightReadStart=0x0400, it is an output block
-        // response that arrived in the same window. Clear inFlightReadStart and fall through to
-        // the outInFlightStart handler so it is decoded correctly (not silently dropped).
-        if let start = inFlightReadStart {
-            let b2 = [UInt8](data)
-            let bc = b2.count >= 3 ? Int(b2[2]) : 0
-            if start == 0x0400 && bc != 0x30 {
-                // Not the live frame — clear in-flight and fall through to outInFlightStart.
-                appLogger.log("PARSER", "live-inFlight byteCount=\(bc)≠0x30 — clearing live in-flight, routing to output handler")
-                inFlightReadStart = nil
-                inFlightSentAt = nil
-                // fall through (no return) to outInFlightStart block below
-            } else {
-                inFlightReadStart = nil
-                inFlightSentAt = nil
-                appLogger.log("PARSER", "live-resp start=0x\(String(start, radix: 16)) len=\(data.count)")
-                _ = decodeDunenPage(data, expectedStart: start)
-                return
-            }
-        }
-
-        if let start = outInFlightStart {
-            let b2 = [UInt8](data)
-            let bc = b2.count >= 3 ? Int(b2[2]) : 0
-            let expectedBC = 2 * (outputPollConfigs.first(where: { $0.start == start })?.count ?? 0)
-            outInFlightStart = nil
-            outInFlightSentAt = nil
-            if expectedBC > 0 && bc != expectedBC {
-                appLogger.log("OUT-PARSE-WARN", "reg=\(start) expected byteCount=\(expectedBC) got=\(bc) len=\(data.count) — will attempt decode anyway")
-            }
-            appLogger.log("PARSER", "output-block resp reg=\(start) bc=\(bc) len=\(data.count)")
+        // Route output-block responses by byteCount — each block has a unique bc.
+        // bc=4→576  bc=44→600  bc=12→682  bc=8→666  bc=28→708
+        let b3 = [UInt8](data)
+        let bc3 = b3.count >= 3 ? Int(b3[2]) : 0
+        let bcToStart: [Int: Int] = [4: 576, 44: 600, 12: 682, 8: 666, 28: 708]
+        if let start = bcToStart[bc3] {
+            appLogger.log("PARSER", "output-block resp bc=\(bc3)→reg=\(start) len=\(data.count)")
             _ = decodeDunenPage(data, expectedStart: start)
             return
         }
@@ -876,11 +807,11 @@ final class DunenBLEManager: NSObject, ObservableObject {
             }
 
             // RPM: ActualSpeed IQ16 words 4(frac),5(int). Signed — negative in reverse.
-            // Dead-band of 3 RPM filters idle rotor oscillation noise so it reads 0 when stopped.
             let motorRPMRaw = iq16At(4)
             let motorRPM = abs(motorRPMRaw)
             let prevRPM = telemetry.rpm
-            telemetry.rpm = motorRPM >= 3.0 ? Int(motorRPM) : 0
+            // Dead-band raised to 5 RPM — logs show idle noise of 1–3 RPM at standstill.
+            telemetry.rpm = motorRPM >= 5.0 ? Int(motorRPM) : 0
             telemetry.wheelRPM = telemetry.rpm > 0 ? Double(telemetry.rpm) / finalDriveRatio : 0
             appLogger.log("DECODE-LIVE", "RPM raw=\(String(format:"%.4f",motorRPMRaw)) → \(telemetry.rpm) (prev=\(prevRPM))")
 
@@ -916,20 +847,15 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 telemetry.regenLevel = 0
             }
 
-            // Motor angle: word 18 = raw u16 encoder position (0–65535, full 360°).
-            // Zero angle: word 20 = encoder value at upright/calibration point.
-            // Lean = signed difference from zero, scaled to degrees.
-            // 65536 counts = 360°, so 1 count = 360/65536 ≈ 0.00549°.
-            // Clamp display to ±42° (reasonable lean limit for a motorcycle/e-moto).
+            // Motor angle: word 18 is the rotor encoder position (0–65535, spins with motor).
+            // This is NOT chassis lean — it changes with throttle/RPM. Store for diagnostics only.
+            // leanAngle is left at 0.0 (no physical lean sensor available on this controller).
             let rawMotor = u16(18)
             let zero = u16(20)
             lastRawMotorCount = rawMotor
             telemetry.motorAngle = rawMotor
             telemetry.zeroAngle = zero
-            // Signed wrap-around subtraction so the value crosses zero cleanly.
-            let rawDiff = Int(Int16(bitPattern: UInt16((rawMotor &- zero) & 0xFFFF)))
-            let degrees = Double(rawDiff) * 360.0 / 65536.0
-            telemetry.leanAngle = max(-42.0, min(42.0, degrees))
+            telemetry.leanAngle = 0.0
 
             // Only update history on the live frame — output blocks don't change RPM/speed
             // so appending on every block would flood the graph with flat segments.
@@ -963,10 +889,19 @@ final class DunenBLEManager: NSObject, ObservableObject {
             }
 
             // OXhFlag (row 303 → addr 602 → words 2,3): handbrake. Non-zero = brake pressed.
+            // Latch: once active, hold brakeActive for at least 200ms to prevent flicker caused
+            // by the controller briefly returning 0 between polls while brake is held.
             let xhHi = u16(2); let xhLo = u16(3)
             let prevBrake = telemetry.brakeActive
-            telemetry.brakeActive = (xhHi | xhLo) != 0
-            appLogger.log("DECODE-A", "OXhFlag hi=\(xhHi) lo=\(xhLo) → brakeActive=\(telemetry.brakeActive) (prev=\(prevBrake))")
+            let xhActive = (xhHi | xhLo) != 0
+            if xhActive {
+                brakeLastActiveAt = Date()
+                telemetry.brakeActive = true
+            } else {
+                let elapsed = brakeLastActiveAt.map { Date().timeIntervalSince($0) } ?? 1.0
+                if elapsed >= 0.20 { telemetry.brakeActive = false }
+            }
+            appLogger.log("DECODE-A", "OXhFlag hi=\(xhHi) lo=\(xhLo) raw=\(xhActive) → brakeActive=\(telemetry.brakeActive) (prev=\(prevBrake))")
 
             // OErrCode (row 307 → addr 610 → words 10,11): LOW word = error code.
             let outErr  = u16(11)   // LOW word of OErrCode  (word 11)
@@ -975,14 +910,15 @@ final class DunenBLEManager: NSObject, ObservableObject {
             telemetry.warningCode = outWarn
 
             // OGearIn (row 309 → addr 614 → words 14,15): 0=Park, 2=Drive, 4=Reverse.
-            // Always use the LOW word (u16(15)) — 0 is a valid value meaning Park.
-            // The old "use HIGH if LOW==0" logic prevented Park from ever being detected.
+            // Log confirms value is in HIGH word (r614): hi=2=Drive, hi=0=Park, hi=4=Rev.
+            // LOW word (r615) is always 0. Use HIGH word.
             let gearHi = u16(14); let gearLo = u16(15)
-            let gearIn = gearLo
+            let gearIn = gearHi
             // OGear (row 310 → addr 616 → words 16,17): LOW word = gear output.
             let gearOut = u16(17)
             telemetry.gearInputRaw = gearIn
             telemetry.gearRaw      = gearOut
+            didReceiveGearData = true   // block A is authoritative source for gear
             appLogger.log("DECODE-A", "OGearIn hi=\(gearHi) lo=\(gearLo) → gearIn=\(gearIn) | OGear lo=\(gearOut)")
 
             // OACC (row 311 → addr 618 → words 18,19): IQ16 throttle position 0.0–1.0.
@@ -1071,8 +1007,9 @@ final class DunenBLEManager: NSObject, ObservableObject {
                 }
             }
 
-            // Always call resolveGearAndRideMode — it gates park/reverse via gearInputRaw.
-            resolveGearAndRideMode()
+            // Only resolve mode from block D if we already have fresh gear data from block A.
+            // Block A is authoritative for gearInputRaw — block D only contributes speedModeRaw.
+            if didReceiveGearData { resolveGearAndRideMode() }
 
         case 576:
             // Block E: OBrK (row 290) brake signal. addr=(290-2)*2=576, count=2 → words 0,1.
@@ -1082,11 +1019,16 @@ final class DunenBLEManager: NSObject, ObservableObject {
             let brkHi = u16(0)   // HIGH word of OBrK
             let brkLo = u16(1)   // LOW word of OBrK
             let prevBrakeE = telemetry.brakeActive
-            // Only update from block E if OXhFlag (block A) is not already showing brake active,
-            // so a sluggish block-E poll doesn't clear a live brakeActive from block A.
             let brkActive = (brkHi | brkLo) != 0
-            if brkActive { telemetry.brakeActive = true }
-            appLogger.log("DECODE-E", "OBrK hi=\(brkHi) lo=\(brkLo) → brakeActive=\(telemetry.brakeActive) (prev=\(prevBrakeE))")
+            // Apply same 200ms latch as block A so both sources are consistent.
+            if brkActive {
+                brakeLastActiveAt = Date()
+                telemetry.brakeActive = true
+            } else {
+                let elapsed = brakeLastActiveAt.map { Date().timeIntervalSince($0) } ?? 1.0
+                if elapsed >= 0.20 { telemetry.brakeActive = false }
+            }
+            appLogger.log("DECODE-E", "OBrK hi=\(brkHi) lo=\(brkLo) raw=\(brkActive) → brakeActive=\(telemetry.brakeActive) (prev=\(prevBrakeE))")
 
         case 0x03E8:
             // Heartbeat/enable frame — no telemetry fields decoded here.
