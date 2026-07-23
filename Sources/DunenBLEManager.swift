@@ -199,29 +199,36 @@ final class DunenBLEManager: NSObject, ObservableObject {
         }
         tuningStore?.markReading()
 
-        // Read each tuning parameter with EXACT count to avoid byteCount=0x30 collision
-        // with the live frame (which also has byteCount=0x30).
-        // addr194 (row 99)  → count=2 → byteCount=4  (no collision)
-        // addr418 (row 211) → count=4 → byteCount=8  covers 418 AND 420 (row 212)
-        let addr194 = 194   // (99-2)*2
-        let addr418 = 418   // (211-2)*2
-
         let writeType: CBCharacteristicWriteType = c.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
 
-        pendingReadStarts.append(addr194)
-        appLogger.log("TUNING-READ", "Sending read addr=\(addr194) count=2 via \(c.uuid.uuidString)")
-        p.writeValue(DunenProtocol.modbusReadFrame(start: addr194, count: 2), for: c, type: writeType)
+        // Each read uses an exact count so byteCount never collides with the live frame (0x30=48).
+        // Reads are staggered 250ms apart to avoid flooding the BLE queue.
+        //
+        //  addr 194  count=2  → byteCount=4   PIDLLDTorqCurveSet1 (Side Support)
+        //  addr 418  count=4  → byteCount=8   PSpeedModMFedk(418) + PSpeedModLFedk(420)
+        //  addr 422  count=2  → byteCount=4   PBrkCmdOffEn (Brake Cutoff)
+        //  addr 532  count=30 → byteCount=60  PAccCurveSet1–15 (throttle curve, 15×2 regs)
+        //  addr 644  count=2  → byteCount=4   PMotorType
+        let reads: [(start: Int, count: Int)] = [
+            (194,  2),   // Side Support
+            (418,  4),   // Rollback + Cruise
+            (422,  2),   // Brake Cutoff
+            (532, 30),   // Throttle curve points 1–15
+            (644,  2),   // Motor/Vehicle Type
+        ]
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self, weak p] in
-            guard let self, let p else { return }
-            guard let c2 = self.writeCharacteristic ?? self.secondaryWriteCharacteristic ?? self.notifyCharacteristic else { return }
-            let wt: CBCharacteristicWriteType = c2.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
-            self.pendingReadStarts.append(addr418)
-            self.appLogger.log("TUNING-READ", "Sending read addr=\(addr418) count=4 via \(c2.uuid.uuidString)")
-            p.writeValue(DunenProtocol.modbusReadFrame(start: addr418, count: 4), for: c2, type: wt)
+        for (idx, read) in reads.enumerated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(idx) * 0.25) { [weak self, weak p] in
+                guard let self, let p else { return }
+                guard let ch = self.writeCharacteristic ?? self.secondaryWriteCharacteristic ?? self.notifyCharacteristic else { return }
+                let wt: CBCharacteristicWriteType = ch.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+                self.pendingReadStarts.append(read.start)
+                self.appLogger.log("TUNING-READ", "addr=\(read.start) count=\(read.count)")
+                p.writeValue(DunenProtocol.modbusReadFrame(start: read.start, count: read.count), for: ch, type: wt)
+            }
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
             if self.tuningStore?.didLoadFromController == false {
                 self.tuningStore?.isReading = false
                 self.tuningStore?.statusText = "Read request sent — waiting for controller response."
