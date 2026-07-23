@@ -1304,23 +1304,49 @@ private func reg32s(_ regs: [Int], idx: Int) -> Double {
 /// Full = 84V (4.2V×20) = 100%, empty = 60V (3.0V×20) = 0%.
 private func liIonSoc20s(_ voltage: Double) -> Double {
     // (voltage, soc%) breakpoints calibrated to real bike BMS readings.
-    // Confirmed: 81.53V = ~98%, 79.36V = 77%, 74V = 48%.
-    // Top anchor shifted: full charge = 84V = 100%, 82V ≈ 98% (was 93% — too low).
+    // User confirmed: 82V = 100% (fully charged), 79.36V = 77%, 74V = 48%.
+    // Top anchor is 82V not 84V — this pack charges to ~82V full.
     let curve: [(v: Double, soc: Double)] = [
-        (84.0, 100.0),
-        (82.0,  98.0),  // ← recalibrated: 81.53V was showing 91%, should be ~98%
-        (81.0,  92.0),
-        (80.5,  88.0),
-        (79.36, 77.0),  // ← confirmed: official app shows 77% at 79.36V
-        (79.0,  75.0),
+        (82.0, 100.0),  // fully charged
+        (81.7,  98.5),
+        (81.4,  97.0),
+        (81.1,  95.0),
+        (80.8,  92.0),
+        (80.5,  88.5),
+        (80.2,  85.0),
+        (79.9,  82.0),
+        (79.6,  79.0),
+        (79.36, 77.0),  // ← confirmed
+        (79.1,  75.0),
+        (78.8,  73.0),
+        (78.4,  70.5),
+        (78.0,  68.0),
         (77.5,  65.0),
+        (77.0,  62.0),
+        (76.5,  59.5),
         (76.0,  57.0),
-        (74.0,  48.0),  // ← confirmed: bike BMS reads 48% at 74V
+        (75.5,  54.5),
+        (75.0,  52.0),
+        (74.5,  50.0),
+        (74.0,  48.0),  // ← confirmed
+        (73.5,  45.5),
+        (73.0,  43.0),
         (72.5,  40.0),
+        (72.0,  37.0),
+        (71.5,  34.0),
         (71.0,  30.0),
+        (70.5,  26.5),
+        (70.0,  23.0),
         (69.5,  20.0),
+        (69.0,  17.0),
+        (68.5,  14.5),
         (68.0,  12.0),
+        (67.5,   9.5),
+        (67.0,   7.5),
+        (66.5,   6.0),
         (66.0,   5.0),
+        (64.0,   2.5),
+        (62.0,   1.0),
         (60.0,   0.0),
     ]
     if voltage >= curve[0].v { return 100.0 }
