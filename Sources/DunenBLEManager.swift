@@ -52,6 +52,7 @@ final class DunenBLEManager: NSObject, ObservableObject {
     private var didReceiveGearData: Bool = false   // true once block A (608) delivered valid gear
     private var modeStaticReadStep: Int = 0
     private var lastModeStaticReadAt: Date?
+    private var liveEnableTickCount: Int = 0
     private var lastSpeedKmh: Double = 0
     private var lastVoltage: Double = 0
     private var brakeLastActiveAt: Date?     // latch: don't clear brake for 200ms after last active signal
@@ -279,36 +280,41 @@ final class DunenBLEManager: NSObject, ObservableObject {
         didSendLiveEnable = false
         didSendDunenTypeReads = false
         lastLiveNotifyAt = nil
+        liveEnableTickCount = 0
         pollIndex = 0
         outputPollIdx = 0
         didReceiveGearData = false
         isInitializing = true
         pollFrames = []
 
-        // Send the live-enable command once — the controller will push 0x0400 frames
-        // automatically via notify at ~300ms. We do NOT poll for it; we just receive it.
-        // A watchdog in the timer re-sends the enable if frames stop arriving.
         sendDunenTypeAndDefaultReadsIfNeeded()
         sendDunenLiveEnableIfNeeded()
 
-        // Single timer at 100ms: blast all 5 output blocks every tick.
-        // Each block has a unique byteCount so responses self-route in addPacket.
-        // The controller can respond to all 5 in ~350ms total (5 × ~60ms round-trip)
-        // which fits comfortably inside the 100ms * 5 = 500ms window.
+        // 100ms timer — blasts output blocks every tick AND redundantly re-sends the
+        // live-enable every 10 ticks (1s). BLE withoutResponse writes have no delivery
+        // guarantee, so we hammer the enable so the controller never stops pushing frames.
+        // Watchdog also covers the case where lastLiveNotifyAt is never set (first enable lost).
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.10, repeats: true) { [weak self] _ in
             guard let self else { return }
             DispatchQueue.main.async {
-                // Watchdog: re-enable live stream if it goes quiet
-                if let last = self.lastLiveNotifyAt, Date().timeIntervalSince(last) > 2.5 {
-                    self.appLogger.log("POLL", "No live notify for >2.5s — re-enabling")
+                self.liveEnableTickCount += 1
+
+                // Re-send enable every 1s unconditionally — belt-and-suspenders.
+                if self.liveEnableTickCount % 10 == 0 {
                     self.didSendLiveEnable = false
                     self.sendDunenLiveEnableIfNeeded(force: true)
                 }
+
+                // Also clear isInitializing after 3s so the overlay never hangs.
+                if self.isInitializing && self.liveEnableTickCount >= 30 {
+                    self.isInitializing = false
+                }
+
                 self.requestAllOutputBlocks()
             }
         }
         pollTimer?.fire()
-        appLogger.log("POLL", "Started outputBlocks=0.10s push-notify for live 0x0400")
+        appLogger.log("POLL", "Started outputBlocks=0.10s liveEnable=1s redundant watchdog")
     }
 
     private var didSendDunenTypeReads: Bool = false
