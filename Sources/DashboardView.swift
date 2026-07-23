@@ -90,7 +90,7 @@ struct MetricsCard: View {
                     metric("Odometer", odo)
                 }
                 HStack {
-                    metric("Current", String(format: "%.1f A", ble.telemetry.currentA))
+                    metric("Current", String(format: "%.2f A", ble.telemetry.currentA))
                     metric("Battery", String(format: "%.0f %%", ble.telemetry.batteryPercent))
                 }
                 HStack {
