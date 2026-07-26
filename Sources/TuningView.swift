@@ -393,7 +393,7 @@ private struct BrakeCutoffHeroCard: View {
                         .foregroundStyle(.orange)
                 }
                 if let p = param, let c = p.currentValue, let pv = p.pendingValue, abs(c - pv) > 0.0001 {
-                    Text("Pending change: \(c >= 0.5 ? "ON" : "OFF") → \(pv >= 0.5 ? "ON" : "OFF")  •  Will write on next "Write" action.")
+                    Text("Pending change: \(c >= 0.5 ? "ON" : "OFF") → \(pv >= 0.5 ? "ON" : "OFF")  •  Will write on next Write action.")
                         .font(.caption2)
                         .foregroundStyle(.cyan)
                 }
