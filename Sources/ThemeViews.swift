@@ -89,6 +89,7 @@ struct LiquidTabBar: View {
 struct MiniLineGraph: View {
     let values: [Double]
     var maxValue: Double? = nil
+    var lineColor: Color = .cyan
 
     var body: some View {
         GeometryReader { geo in
@@ -104,8 +105,8 @@ struct MiniLineGraph: View {
                     else { path.addLine(to: CGPoint(x: x, y: y)) }
                 }
             }
-            .stroke(.cyan, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
-            .shadow(color: .cyan.opacity(0.45), radius: 8)
+            .stroke(lineColor, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
+            .shadow(color: lineColor.opacity(0.45), radius: 8)
         }
     }
 }

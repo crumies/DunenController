@@ -2,6 +2,7 @@ import UIKit
 import AudioToolbox
 import SwiftUI
 import AVFoundation
+import UserNotifications
 
 @main
 struct AptumDashboardApp: App {
@@ -24,6 +25,9 @@ struct AptumDashboardApp: App {
                     ble.attachTuningStore(tuning)
                     ble.attachSettings(settings)
                     tuning.loadLocalBackup()
+                    NotificationManager.shared.requestAuthorization()
+                    // Cancel any pending ride reminders since the user just opened the app.
+                    NotificationManager.shared.cancelRideReminders()
                 }
         }
     }

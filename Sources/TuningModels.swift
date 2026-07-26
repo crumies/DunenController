@@ -7,10 +7,9 @@ enum TuningKind: String, Codable {
 }
 
 enum TuningGroup: String, CaseIterable, Codable {
-    case vehicle     = "Vehicle"
-    case brake       = "Brake"
-    case throttle    = "Throttle"
-    case common      = "Common"
+    case brake    = "Brake"
+    case throttle = "Throttle"
+    case common   = "Common"
 }
 
 struct TuningParameter: Identifiable, Codable, Equatable {
@@ -54,20 +53,9 @@ struct TuningParameter: Identifiable, Codable, Equatable {
     //   row 212 → addr 420 = PSpeedModLFedk  (known working ✓)
     //   row 213 → addr 422 = PBrkCmdOffEn    (刹车断电使能)
     //   row 268 → addr 532 = PAccCurveSet1   (油门曲线设置点1)  …+2 per point
-    //   row 324 → addr 644 = PMotorType      (电机型号)
+    // Note: PMotorType (addr 644) is visual-only; not in this list.
 
     static let defaults: [TuningParameter] = [
-
-        // ── VEHICLE ─────────────────────────────────────────────────────────
-        // PMotorType  row 324 → addr 644
-        // 0 = default type, 1 = alternate type (two power variants)
-        .init(id: 644,
-              internalName: "PMotorType",
-              displayName: "Motor / Vehicle Type",
-              detail: "Select the power variant of your vehicle. 0 = Standard, 1 = High-power. Change only if instructed by your dealer. Requires controller restart.",
-              group: .vehicle, kind: .picker,
-              min: 0, max: 1, step: 1, unit: "",
-              isRisky: true),
 
         // ── BRAKE ────────────────────────────────────────────────────────────
         // PBrkCmdOffEn  row 213 → addr 422

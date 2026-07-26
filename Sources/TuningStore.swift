@@ -36,6 +36,35 @@ final class TuningStore: ObservableObject {
         parameters[idx].pendingValue = min(max(value, parameters[idx].min), parameters[idx].max)
     }
 
+    /// Like updatePending but also enforces monotonicity for throttle curve sliders:
+    /// points before `id` are clamped to ≤ newValue; points after are clamped to ≥ newValue.
+    func updatePendingMonotone(id: Int, value: Double) {
+        guard let idx = parameters.firstIndex(where: { $0.id == id }) else {
+            updatePending(id: id, value: value)
+            return
+        }
+        // Only apply monotone logic to throttle curve parameters
+        let isThrottle = parameters[idx].group == .throttle && parameters[idx].kind == .slider
+        guard isThrottle else {
+            updatePending(id: id, value: value)
+            return
+        }
+
+        let clamped = min(max(value, parameters[idx].min), parameters[idx].max)
+        parameters[idx].pendingValue = clamped
+
+        // Clamp preceding points to ≤ clamped
+        for i in 0..<idx where parameters[i].group == .throttle && parameters[i].kind == .slider {
+            let prev = parameters[i].pendingValue ?? parameters[i].currentValue ?? 0
+            if prev > clamped { parameters[i].pendingValue = clamped }
+        }
+        // Clamp following points to ≥ clamped
+        for i in (idx + 1)..<parameters.count where parameters[i].group == .throttle && parameters[i].kind == .slider {
+            let next = parameters[i].pendingValue ?? parameters[i].currentValue ?? 0
+            if next < clamped { parameters[i].pendingValue = clamped }
+        }
+    }
+
     func confirmWritten(ids: [Int]) {
         for idx in parameters.indices {
             if ids.contains(parameters[idx].id), let pending = parameters[idx].pendingValue {

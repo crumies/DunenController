@@ -337,6 +337,12 @@ struct ModeBadge: View {
         .padding(.vertical, 7)
         .background(color.opacity(0.12))
         .clipShape(Capsule())
+        .animation(.spring(response: 0.30, dampingFraction: 0.72), value: mode)
+        .id(mode)
+        .transition(.asymmetric(
+            insertion: .scale(scale: 0.75).combined(with: .opacity),
+            removal: .scale(scale: 1.25).combined(with: .opacity)
+        ))
     }
 }
 
@@ -502,6 +508,17 @@ struct GraphPanel: View {
     var fullscreenButton: () -> Void
     var compact: Bool = false
 
+    // Dynamic RPM max scales with the mode's limit so the needle isn't always pegged low.
+    private var rpmMax: Double {
+        switch ble.telemetry.mode {
+        case .eco:     return 4500
+        case .xc:      return 6500
+        case .sports:  return 8500
+        case .reverse: return 500
+        case .park:    return 1000
+        }
+    }
+
     var body: some View {
         GlassCard {
             VStack(alignment: .leading, spacing: compact ? 7 : 11) {
@@ -514,22 +531,47 @@ struct GraphPanel: View {
                     }
                 }
 
-                graphRow("Speed", value: String(format: "%.0f %@", settings.speedUnit == .kmh ? ble.telemetry.speedKmh : ble.telemetry.speedKmh * 0.621371, settings.speedUnit.rawValue), values: ble.history.speed, max: 120)
-                graphRow("RPM", value: "\(ble.telemetry.rpm) rpm", values: ble.history.rpm, max: 9000)
-                graphRow("Voltage", value: String(format: "%.4f V", ble.telemetry.voltage), values: ble.history.voltage, max: 90)
-                graphRow("Current", value: String(format: "%.1f A", ble.telemetry.currentA), values: ble.history.current, max: 140)
+                graphRow("Speed",
+                    value: String(format: "%.1f %@",
+                        settings.speedUnit == .kmh ? ble.telemetry.speedKmh : ble.telemetry.speedKmh * 0.621371,
+                        settings.speedUnit.rawValue),
+                    values: ble.history.speed,
+                    color: .cyan,
+                    max: 120)
+                graphRow("RPM",
+                    value: "\(ble.telemetry.rpm) rpm",
+                    values: ble.history.rpm,
+                    color: .orange,
+                    max: rpmMax)
+                graphRow("Voltage",
+                    value: String(format: "%.2f V", ble.telemetry.voltage),
+                    values: ble.history.voltage,
+                    color: .green,
+                    max: 84)
+                graphRow("Current",
+                    value: String(format: "%.2f A", ble.telemetry.currentA),
+                    values: ble.history.current,
+                    color: .yellow,
+                    max: max(10, (ble.history.current.max() ?? 10) * 1.25))
+                if ble.telemetry.powerKw > 0 || ble.history.current.count > 2 {
+                    graphRow("Power",
+                        value: String(format: "%.1f kW", ble.telemetry.powerKw),
+                        values: ble.history.current.map { $0 * ble.telemetry.voltage / 1000 },
+                        color: .purple,
+                        max: 12)
+                }
             }
         }
     }
 
-    private func graphRow(_ title: String, value: String, values: [Double], max: Double) -> some View {
+    private func graphRow(_ title: String, value: String, values: [Double], color: Color, max: Double) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack {
                 Text(title).font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Text(value).font(.caption.weight(.bold)).foregroundStyle(title == "Speed" ? .cyan : .primary)
+                Text(value).font(.caption.weight(.bold)).foregroundStyle(color)
             }
-            MiniLineGraph(values: values, maxValue: max).frame(height: compact ? 34 : 44)
+            MiniLineGraph(values: values, maxValue: max, lineColor: color).frame(height: compact ? 34 : 44)
         }
     }
 }

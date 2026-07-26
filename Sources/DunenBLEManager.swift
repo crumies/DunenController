@@ -208,13 +208,12 @@ final class DunenBLEManager: NSObject, ObservableObject {
         //  addr 418  count=4  → byteCount=8   PSpeedModMFedk(418) + PSpeedModLFedk(420)
         //  addr 422  count=2  → byteCount=4   PBrkCmdOffEn (Brake Cutoff)
         //  addr 532  count=30 → byteCount=60  PAccCurveSet1–15 (throttle curve, 15×2 regs)
-        //  addr 644  count=2  → byteCount=4   PMotorType
+        // Note: PMotorType (addr 644) is visual-only — NOT read from controller.
         let reads: [(start: Int, count: Int)] = [
             (194,  2),   // Side Support
             (418,  4),   // Rollback + Cruise
             (422,  2),   // Brake Cutoff
             (532, 30),   // Throttle curve points 1–15
-            (644,  2),   // Motor/Vehicle Type
         ]
 
         for (idx, read) in reads.enumerated() {
@@ -1063,9 +1062,13 @@ final class DunenBLEManager: NSObject, ObservableObject {
     }
 
     private func calculateDerived(dt: Double) {
-        // Do NOT calculate power from amps — controller does not provide a kW register.
-        // Leave powerKw as 0 so UI can show "—" instead of a derived/inaccurate value.
-        telemetry.powerKw = 0
+        // Power = voltage × bus current. We use phase current (Imag) as a proxy since
+        // DC bus current is not available in a separate register. This is an estimate.
+        if telemetry.voltage > 0 && telemetry.currentA > 0 {
+            telemetry.powerKw = (telemetry.voltage * telemetry.currentA / 1000.0 * 10.0).rounded() / 10.0
+        } else {
+            telemetry.powerKw = 0
+        }
 
         if telemetry.bmsSoc > 0 && telemetry.bmsSoc <= 100 {
             telemetry.batteryPercent = telemetry.bmsSoc
@@ -1198,6 +1201,8 @@ extension DunenBLEManager: @preconcurrency CBCentralManagerDelegate {
         connectionStatus = "Connected. Discovering services..."
         let connectSoundEnabled = settings?.startupSound ?? true
         Task { @MainActor in SoundManager.shared.playConnectSound(enabled: connectSoundEnabled) }
+        // User connected — cancel any pending re-engagement notifications.
+        NotificationManager.shared.cancelRideReminders()
         peripheral.discoverServices([serviceFFE0])
     }
 
@@ -1214,6 +1219,8 @@ extension DunenBLEManager: @preconcurrency CBCentralManagerDelegate {
         writeCharacteristic = nil
         stopPollTimer()
         connectionStatus = "Disconnected"
+        // Schedule re-engagement nudges now that the user has disconnected.
+        NotificationManager.shared.scheduleRideReminders()
     }
 }
 

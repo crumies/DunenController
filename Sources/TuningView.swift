@@ -1,5 +1,7 @@
 import SwiftUI
 
+// MARK: - Main Tuning View
+
 struct TuningView: View {
     @EnvironmentObject var ble: DunenBLEManager
     @EnvironmentObject var tuning: TuningStore
@@ -21,7 +23,13 @@ struct TuningView: View {
                 VStack(spacing: 16) {
                     header
 
-                    // Status + read/backup controls
+                    // ── Disclaimer ─────────────────────────────────────────────
+                    disclaimerBanner
+
+                    // ── Vehicle Model — always visible, no lock required ────────
+                    VehicleModelCard()
+
+                    // ── Read / Backup controls ─────────────────────────────────
                     GlassCard(glow: tuning.didLoadFromController) {
                         VStack(alignment: .leading, spacing: 12) {
                             Text(tuning.statusText)
@@ -42,7 +50,7 @@ struct TuningView: View {
                         }
                     }
 
-                    // Group picker
+                    // ── Group picker ───────────────────────────────────────────
                     Picker("Group", selection: $selectedGroup) {
                         ForEach(TuningGroup.allCases, id: \.self) { g in
                             Text(g.rawValue).tag(g)
@@ -53,12 +61,29 @@ struct TuningView: View {
                     if !settings.expertTuningUnlocked {
                         lockedCard
                     } else {
-                        // Throttle curve gets a compact visual overview card
+                        // Brake tab: show hero brake cutoff card first
+                        if selectedGroup == .brake {
+                            BrakeCutoffHeroCard(
+                                param: tuning.parameters.first { $0.internalName == "PBrkCmdOffEn" },
+                                disabled: !tuning.didLoadFromController
+                            ) { newVal in
+                                if let p = tuning.parameters.first(where: { $0.internalName == "PBrkCmdOffEn" }) {
+                                    var edited = p; edited.pendingValue = newVal
+                                    pendingToggle = edited
+                                }
+                            }
+                        }
+
+                        // Throttle tab: show preset picker + live SVG preview first
                         if selectedGroup == .throttle {
+                            ThrottlePresetCard(disabled: !tuning.didLoadFromController)
                             ThrottleCurvePreview(params: filtered)
                         }
 
-                        ForEach(filtered) { param in
+                        // Parameter rows (skip PBrkCmdOffEn in Brake — shown in hero)
+                        ForEach(filtered.filter { p in
+                            !(selectedGroup == .brake && p.internalName == "PBrkCmdOffEn")
+                        }) { param in
                             switch param.kind {
                             case .toggle:
                                 ToggleRow(param: param, disabled: !tuning.didLoadFromController) { newVal in
@@ -67,7 +92,7 @@ struct TuningView: View {
                                 }
                             case .slider:
                                 SliderRow(param: param, disabled: !tuning.didLoadFromController) { newVal in
-                                    tuning.updatePending(id: param.id, value: newVal)
+                                    tuning.updatePendingMonotone(id: param.id, value: newVal)
                                 }
                             case .picker:
                                 PickerRow(param: param, disabled: !tuning.didLoadFromController) { newVal in
@@ -93,7 +118,8 @@ struct TuningView: View {
                 .padding(.bottom, 82)
             }
 
-            // ── Dialogs ────────────────────────────────────────────────────
+            // ── Dialogs ──────────────────────────────────────────────────────
+
             if showUnlock {
                 StyledConfirmDialog(
                     title: "Unlock Tuning?",
@@ -179,6 +205,23 @@ struct TuningView: View {
         }
     }
 
+    private var disclaimerBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.shield.fill")
+                .foregroundStyle(.orange)
+                .font(.title3)
+            Text("We are not responsible for actions which may happen after settings are changed.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.08))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.orange.opacity(0.35), lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
     private var lockedCard: some View {
         GlassCard(glow: true) {
             VStack(spacing: 12) {
@@ -194,6 +237,295 @@ struct TuningView: View {
                 .buttonStyle(.borderedProminent).tint(.orange)
             }
             .frame(maxWidth: .infinity)
+        }
+    }
+}
+
+// MARK: - Vehicle Model Card (always visible, no lock, visual only)
+
+private struct VehicleModelCard: View {
+    @EnvironmentObject var settings: AppSettings
+
+    private let models: [(model: VehicleModel, icon: String, kw: String, detail: String)] = [
+        (.standard,  "bolt.circle",      "8 kW",  "8kW / 72V — standard configuration"),
+        (.highPower, "bolt.circle.fill", "10 kW", "10kW / 72V — high power configuration"),
+    ]
+
+    var body: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Image(systemName: "car.2.fill")
+                        .foregroundStyle(.cyan)
+                    Text("Vehicle Model  (车型选择)")
+                        .font(.headline.weight(.bold))
+                    Spacer()
+                    Text("Visual only")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack(spacing: 10) {
+                    ForEach(models, id: \.model) { item in
+                        let selected = settings.selectedVehicleModel == item.model
+                        Button {
+                            // Visual only — just save to app settings, never writes to controller
+                            settings.selectedVehicleModel = item.model
+                        } label: {
+                            VStack(spacing: 8) {
+                                Image(systemName: item.icon)
+                                    .font(.title)
+                                    .foregroundStyle(selected ? .cyan : .secondary)
+                                Text(item.model.rawValue)
+                                    .font(.subheadline.weight(.bold))
+                                    .foregroundStyle(selected ? .primary : .secondary)
+                                Text(item.kw)
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(selected ? .cyan : .secondary)
+                                Text(item.detail)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .multilineTextAlignment(.center)
+                                    .lineLimit(2)
+                            }
+                            .padding(10)
+                            .frame(maxWidth: .infinity)
+                            .background(selected ? Color.cyan.opacity(0.12) : Color.white.opacity(0.04))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .stroke(selected ? Color.cyan.opacity(0.7) : Color.white.opacity(0.12), lineWidth: selected ? 1.5 : 1)
+                            )
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                        }
+                        .buttonStyle(.plain)
+                        .animation(.spring(response: 0.28, dampingFraction: 0.72), value: selected)
+                    }
+                }
+
+                Text("This selection is for display purposes only and does not change any controller parameters.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+// MARK: - Brake Cutoff Hero Card
+
+private struct BrakeCutoffHeroCard: View {
+    let param: TuningParameter?
+    let disabled: Bool
+    let onChange: (Double) -> Void
+
+    private var isEnabled: Bool {
+        (param?.pendingValue ?? param?.currentValue ?? 0) >= 0.5
+    }
+
+    var body: some View {
+        GlassCard(glow: isEnabled) {
+            VStack(spacing: 14) {
+                HStack {
+                    Image(systemName: "brake.signal")
+                        .font(.title2)
+                        .foregroundStyle(isEnabled ? .cyan : .secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Brake Cutoff  (刹车断电)")
+                            .font(.title3.weight(.bold))
+                        Text("Most commonly used setting")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    // Big status pill
+                    Text(isEnabled ? "ON" : "OFF")
+                        .font(.headline.weight(.heavy))
+                        .foregroundStyle(isEnabled ? .black : .secondary)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 7)
+                        .background(isEnabled ? Color.cyan : Color.white.opacity(0.10))
+                        .clipShape(Capsule())
+                        .animation(.spring(response: 0.28, dampingFraction: 0.72), value: isEnabled)
+                }
+
+                Text("When ON, squeezing the brake lever immediately cuts motor power — the safest and most common configuration. When OFF, the motor continues running through braking.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 12) {
+                    // OFF button
+                    Button {
+                        guard !disabled, let _ = param else { return }
+                        onChange(0)
+                    } label: {
+                        Text("Disable")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(!isEnabled ? Color.white.opacity(0.18) : Color.clear)
+                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.22), lineWidth: 1))
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                            .foregroundStyle(!isEnabled ? .primary : .secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(disabled || param == nil)
+
+                    // ON button
+                    Button {
+                        guard !disabled, let _ = param else { return }
+                        onChange(1)
+                    } label: {
+                        Text("Enable")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(isEnabled ? Color.cyan.opacity(0.85) : Color.cyan.opacity(0.15))
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                            .foregroundStyle(isEnabled ? .black : .cyan)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(disabled || param == nil)
+                }
+
+                if param == nil || !(param?.loaded ?? false) {
+                    Text("Press \"Read Current Settings\" to load the current controller value.")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+                if let p = param, let c = p.currentValue, let pv = p.pendingValue, abs(c - pv) > 0.0001 {
+                    Text("Pending change: \(c >= 0.5 ? "ON" : "OFF") → \(pv >= 0.5 ? "ON" : "OFF")  •  Will write on next "Write" action.")
+                        .font(.caption2)
+                        .foregroundStyle(.cyan)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Throttle Preset Card
+
+private struct ThrottlePresetCard: View {
+    @EnvironmentObject var tuning: TuningStore
+    let disabled: Bool
+
+    enum ThrottlePreset: String, CaseIterable, Identifiable {
+        case eco    = "Eco"
+        case linear = "Linear"
+        case sport  = "Sport"
+        case custom = "Custom"
+        var id: String { rawValue }
+
+        var icon: String {
+            switch self {
+            case .eco: return "leaf.fill"
+            case .linear: return "equal"
+            case .sport: return "flame.fill"
+            case .custom: return "slider.horizontal.3"
+            }
+        }
+
+        var color: Color {
+            switch self {
+            case .eco: return .green
+            case .linear: return .cyan
+            case .sport: return .orange
+            case .custom: return .purple
+            }
+        }
+
+        var description: String {
+            switch self {
+            case .eco:    return "Gentle / progressive — starts soft, builds gradually. Good for city."
+            case .linear: return "Straight 1:1 — torque directly follows throttle position."
+            case .sport:  return "Aggressive — jumps to 60% torque at half throttle. Max response."
+            case .custom: return "Your own curve — adjust each point manually below."
+            }
+        }
+
+        // 15 normalised torque fractions (0.0–1.0)
+        var points: [Double]? {
+            switch self {
+            case .eco:
+                return [0.03, 0.06, 0.10, 0.14, 0.19, 0.25, 0.32, 0.40, 0.49, 0.58, 0.68, 0.77, 0.86, 0.93, 1.00]
+            case .linear:
+                return stride(from: 1, through: 15, by: 1).map { Double($0) / 15.0 }
+            case .sport:
+                return [0.12, 0.22, 0.33, 0.44, 0.55, 0.63, 0.70, 0.77, 0.83, 0.88, 0.92, 0.95, 0.97, 0.99, 1.00]
+            case .custom:
+                return nil
+            }
+        }
+    }
+
+    // Current active preset (detected from live points, else .custom)
+    private var activePreset: ThrottlePreset {
+        let current = currentPoints
+        for preset in [ThrottlePreset.eco, .linear, .sport] {
+            guard let pts = preset.points else { continue }
+            if zip(current, pts).allSatisfy({ abs($0.0 - $0.1) < 0.005 }) { return preset }
+        }
+        return .custom
+    }
+
+    private var currentPoints: [Double] {
+        tuning.parameters
+            .filter { $0.group == .throttle && $0.kind == .slider }
+            .sorted { $0.id < $1.id }
+            .map { $0.pendingValue ?? $0.currentValue ?? 0 }
+    }
+
+    var body: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Image(systemName: "waveform.path")
+                        .foregroundStyle(.cyan)
+                    Text("Throttle Preset  (油门预设)")
+                        .font(.headline.weight(.bold))
+                }
+
+                // Preset selector tiles
+                HStack(spacing: 8) {
+                    ForEach(ThrottlePreset.allCases) { preset in
+                        let selected = activePreset == preset
+                        Button {
+                            guard !disabled, let pts = preset.points else { return }
+                            applyPreset(pts)
+                        } label: {
+                            VStack(spacing: 5) {
+                                Image(systemName: preset.icon)
+                                    .font(.title3)
+                                    .foregroundStyle(selected ? preset.color : .secondary)
+                                Text(preset.rawValue)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(selected ? .primary : .secondary)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 9)
+                            .background(selected ? preset.color.opacity(0.15) : Color.white.opacity(0.04))
+                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(
+                                selected ? preset.color.opacity(0.7) : Color.white.opacity(0.10), lineWidth: selected ? 1.5 : 1))
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(disabled || preset == .custom)
+                        .animation(.spring(response: 0.28, dampingFraction: 0.72), value: selected)
+                    }
+                }
+
+                Text(activePreset.description)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func applyPreset(_ pts: [Double]) {
+        // IDs are 532, 534, 536 ... 560 (step 2, 15 points)
+        let baseID = 532
+        for (i, val) in pts.enumerated() {
+            tuning.updatePending(id: baseID + i * 2, value: val)
         }
     }
 }

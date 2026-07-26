@@ -81,6 +81,27 @@ enum RideMode: String, CaseIterable, Codable, Identifiable {
     }
 }
 
+enum VehicleModel: String, CaseIterable, Identifiable, Codable {
+    case standard   = "Standard"
+    case highPower  = "High Power"
+
+    var id: String { rawValue }
+
+    var detail: String {
+        switch self {
+        case .standard:  return "8kW / 72V — standard configuration"
+        case .highPower: return "10kW / 72V — high power configuration"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .standard:  return "bolt.circle"
+        case .highPower: return "bolt.circle.fill"
+        }
+    }
+}
+
 final class AppSettings: ObservableObject {
     @AppStorage("speedUnit") var speedUnitRaw: String = SpeedUnit.kmh.rawValue
     @AppStorage("appearanceMode") var appearanceRaw: String = AppearanceMode.system.rawValue
@@ -110,6 +131,13 @@ final class AppSettings: ObservableObject {
     @AppStorage("hudShowLeanCard") var hudShowLeanCard: Bool = false
     @AppStorage("hudShowGPSSpeed") var hudShowGPSSpeed: Bool = false
     @AppStorage("demoAutoInput") var demoAutoInput: Bool = true
+    @AppStorage("selectedVehicleModel") var selectedVehicleModelRaw: String = VehicleModel.standard.rawValue
+    @AppStorage("lastConnectedDate") var lastConnectedDateRaw: Double = 0
+
+    var selectedVehicleModel: VehicleModel {
+        get { VehicleModel(rawValue: selectedVehicleModelRaw) ?? .standard }
+        set { selectedVehicleModelRaw = newValue.rawValue }
+    }
 
     var speedUnit: SpeedUnit {
         get { SpeedUnit(rawValue: speedUnitRaw) ?? .kmh }
